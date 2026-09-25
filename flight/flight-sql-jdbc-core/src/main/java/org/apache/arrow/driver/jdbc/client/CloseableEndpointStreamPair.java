@@ -16,7 +16,6 @@
  */
 package org.apache.arrow.driver.jdbc.client;
 
-import org.apache.arrow.flight.FlightStream;
 import org.apache.arrow.flight.sql.FlightSqlClient;
 import org.apache.arrow.util.AutoCloseables;
 import org.apache.arrow.util.Preconditions;
@@ -24,15 +23,15 @@ import org.apache.arrow.util.Preconditions;
 /** Represents a connection to a {@link org.apache.arrow.flight.FlightEndpoint}. */
 public class CloseableEndpointStreamPair implements AutoCloseable {
 
-  private final FlightStream stream;
+  private final EndpointStream stream;
   private final FlightSqlClient client;
 
-  public CloseableEndpointStreamPair(FlightStream stream, FlightSqlClient client) {
+  public CloseableEndpointStreamPair(EndpointStream stream, FlightSqlClient client) {
     this.stream = Preconditions.checkNotNull(stream);
     this.client = client;
   }
 
-  public FlightStream getStream() {
+  public EndpointStream getStream() {
     return stream;
   }
 

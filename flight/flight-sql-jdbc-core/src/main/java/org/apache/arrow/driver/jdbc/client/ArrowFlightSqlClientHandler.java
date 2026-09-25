@@ -153,7 +153,8 @@ public final class ArrowFlightSqlClientHandler implements AutoCloseable {
           // the end.
           endpoints.add(
               new CloseableEndpointStreamPair(
-                  sqlClient.getStream(endpoint.getTicket(), getOptions()), null));
+                  new GrpcEndpointStream(sqlClient.getStream(endpoint.getTicket(), getOptions())),
+                  null));
         } else {
           // Clone the builder and then set the new endpoint on it.
 
@@ -177,17 +178,40 @@ public final class ArrowFlightSqlClientHandler implements AutoCloseable {
           while (locations.hasNext()) {
             Location location = locations.next();
             final URI endpointUri = location.getUri();
-            if (endpointUri.getScheme().equals(LocationSchemes.REUSE_CONNECTION)) {
+            final String endpointScheme =
+                endpointUri.getScheme() == null ? "" : endpointUri.getScheme();
+            // FG patch: an endpoint with an empty ticket and an http(s) location addresses
+            // its data by a (pre-signed) URL — fetch it over plain HTTP GET instead of
+            // dialing a gRPC client for the location.
+            if (endpoint.getTicket().getBytes().length == 0
+                && ("http".equalsIgnoreCase(endpointScheme)
+                    || "https".equalsIgnoreCase(endpointScheme))) {
+              try {
+                stream =
+                    new CloseableEndpointStreamPair(
+                        new ReaderEndpointStream(sqlClient.openEndpoint(endpoint, getOptions())),
+                        null);
+                // Make sure we actually get data from the server
+                stream.getStream().getSchema();
+              } catch (Exception ex) {
+                exceptions.add(ex);
+                continue;
+              }
+              break;
+            }
+            if (endpointScheme.equals(LocationSchemes.REUSE_CONNECTION)) {
               stream =
                   new CloseableEndpointStreamPair(
-                      sqlClient.getStream(endpoint.getTicket(), getOptions()), null);
+                      new GrpcEndpointStream(
+                          sqlClient.getStream(endpoint.getTicket(), getOptions())),
+                      null);
               break;
             }
             final Builder builderForEndpoint =
                 new Builder(ArrowFlightSqlClientHandler.this.builder)
                     .withHost(endpointUri.getHost())
                     .withPort(endpointUri.getPort())
-                    .withEncryption(endpointUri.getScheme().equals(LocationSchemes.GRPC_TLS))
+                    .withEncryption(endpointScheme.equals(LocationSchemes.GRPC_TLS))
                     .withClientCache(flightClientCache)
                     .withConnectTimeout(builder.connectTimeout);
 
@@ -196,8 +220,9 @@ public final class ArrowFlightSqlClientHandler implements AutoCloseable {
               endpointHandler = builderForEndpoint.build();
               stream =
                   new CloseableEndpointStreamPair(
-                      endpointHandler.sqlClient.getStream(
-                          endpoint.getTicket(), endpointHandler.getOptions()),
+                      new GrpcEndpointStream(
+                          endpointHandler.sqlClient.getStream(
+                              endpoint.getTicket(), endpointHandler.getOptions())),
                       endpointHandler.sqlClient);
               // Make sure we actually get data from the server
               stream.getStream().getSchema();

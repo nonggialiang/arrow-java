@@ -28,7 +28,6 @@ import org.apache.arrow.driver.jdbc.client.CloseableEndpointStreamPair;
 import org.apache.arrow.driver.jdbc.utils.FlightEndpointDataQueue;
 import org.apache.arrow.driver.jdbc.utils.VectorSchemaRootTransformer;
 import org.apache.arrow.flight.FlightInfo;
-import org.apache.arrow.flight.FlightStream;
 import org.apache.arrow.util.AutoCloseables;
 import org.apache.arrow.vector.VectorSchemaRoot;
 import org.apache.arrow.vector.types.pojo.Schema;

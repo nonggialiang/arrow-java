@@ -22,6 +22,7 @@ module org.apache.arrow.flight.sql {
 
   requires com.google.common;
   requires com.google.protobuf;
+  requires java.net.http;
   requires java.sql;
   requires org.apache.arrow.flight.core;
   requires org.apache.arrow.memory.core;

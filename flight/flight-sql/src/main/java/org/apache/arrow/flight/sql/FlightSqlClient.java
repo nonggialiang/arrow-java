@@ -50,7 +50,14 @@ import com.google.protobuf.ByteString;
 import com.google.protobuf.InvalidProtocolBufferException;
 import java.io.ByteArrayInputStream;
 import java.io.IOException;
+import java.io.InputStream;
+import java.net.ProxySelector;
+import java.net.URI;
+import java.net.http.HttpClient;
+import java.net.http.HttpRequest;
+import java.net.http.HttpResponse;
 import java.nio.channels.Channels;
+import java.time.Duration;
 import java.util.Arrays;
 import java.util.Collections;
 import java.util.Iterator;
@@ -58,6 +65,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.Objects;
 import java.util.concurrent.ExecutionException;
+import java.util.concurrent.TimeUnit;
 import java.util.function.Consumer;
 import java.util.stream.Collectors;
 import org.apache.arrow.flight.Action;
@@ -71,9 +79,13 @@ import org.apache.arrow.flight.FlightClient;
 import org.apache.arrow.flight.FlightDescriptor;
 import org.apache.arrow.flight.FlightEndpoint;
 import org.apache.arrow.flight.FlightInfo;
+import org.apache.arrow.flight.FlightRuntimeException;
+import org.apache.arrow.flight.FlightStatusCode;
 import org.apache.arrow.flight.FlightStream;
 import org.apache.arrow.flight.GetSessionOptionsRequest;
 import org.apache.arrow.flight.GetSessionOptionsResult;
+import org.apache.arrow.flight.Location;
+import org.apache.arrow.flight.PollInfo;
 import org.apache.arrow.flight.PutResult;
 import org.apache.arrow.flight.RenewFlightEndpointRequest;
 import org.apache.arrow.flight.Result;
@@ -89,16 +101,39 @@ import org.apache.arrow.flight.sql.impl.FlightSql.CommandStatementIngest;
 import org.apache.arrow.flight.sql.impl.FlightSql.CommandStatementIngest.TableDefinitionOptions;
 import org.apache.arrow.flight.sql.util.TableRef;
 import org.apache.arrow.memory.ArrowBuf;
+import org.apache.arrow.memory.BufferAllocator;
 import org.apache.arrow.util.AutoCloseables;
 import org.apache.arrow.util.Preconditions;
 import org.apache.arrow.vector.VectorSchemaRoot;
+import org.apache.arrow.vector.VectorUnloader;
 import org.apache.arrow.vector.ipc.ArrowReader;
+import org.apache.arrow.vector.ipc.ArrowStreamReader;
 import org.apache.arrow.vector.ipc.ReadChannel;
+import org.apache.arrow.vector.ipc.message.ArrowRecordBatch;
 import org.apache.arrow.vector.ipc.message.MessageSerializer;
 import org.apache.arrow.vector.types.pojo.Schema;
 
 /** Flight client with Flight SQL semantics. */
 public class FlightSqlClient implements AutoCloseable {
+  /** Total budget for the client-side poll loop in {@link #pollWithFallback}. */
+  private static final long POLL_TOTAL_DEADLINE_MS = TimeUnit.MINUTES.toMillis(10);
+
+  private static final long POLL_INITIAL_BACKOFF_MS = 100;
+
+  private static final long POLL_MAX_BACKOFF_MS = 1000;
+
+  /**
+   * Shared HTTP client for endpoints addressed by http(s) locations (e.g. pre-signed URLs). The
+   * proxy is explicitly disabled (system proxies would break pre-signed localhost/object-store
+   * URLs), redirects are followed, and the connect timeout is bounded.
+   */
+  private static final HttpClient HTTP_CLIENT =
+      HttpClient.newBuilder()
+          .proxy(ProxySelector.of(null))
+          .followRedirects(HttpClient.Redirect.NORMAL)
+          .connectTimeout(Duration.ofSeconds(30))
+          .build();
+
   private final FlightClient client;
 
   public FlightSqlClient(final FlightClient client) {
@@ -133,7 +168,7 @@ public class FlightSqlClient implements AutoCloseable {
     }
     final FlightDescriptor descriptor =
         FlightDescriptor.command(Any.pack(builder.build()).toByteArray());
-    return client.getInfo(descriptor, options);
+    return pollWithFallback(client, descriptor, options);
   }
 
   /**
@@ -514,6 +549,156 @@ public class FlightSqlClient implements AutoCloseable {
    */
   public FlightStream getStream(Ticket ticket, CallOption... options) {
     return client.getStream(ticket, options);
+  }
+
+  /**
+   * Open a reader for a {@link FlightEndpoint}, including endpoints whose data is addressed by an
+   * http(s) location instead of a Flight ticket (e.g. pre-signed URLs, where the ticket is empty
+   * and the location carries the full URL).
+   *
+   * <p>For http(s) endpoints the data is fetched with a plain HTTP GET (Arrow IPC stream assumed)
+   * using a shared HTTP client with system proxies disabled; the response body is released when the
+   * returned reader is closed. Any other endpoint is consumed over gRPC (DoGet on this client's
+   * channel), adapted to the {@link ArrowReader} surface with a per-batch copy out of the
+   * underlying {@link FlightStream}.
+   *
+   * @param endpoint The endpoint to consume.
+   * @param options RPC-layer hints for the gRPC path (ignored on the HTTP path).
+   * @return A reader over the endpoint's records.
+   */
+  public ArrowReader openEndpoint(FlightEndpoint endpoint, CallOption... options) {
+    final List<Location> locations = endpoint.getLocations();
+    if (endpoint.getTicket().getBytes().length == 0 && !locations.isEmpty()) {
+      final URI uri = locations.get(0).getUri();
+      final String scheme = uri.getScheme() == null ? "" : uri.getScheme().toLowerCase();
+      if ("http".equals(scheme) || "https".equals(scheme)) {
+        return openHttpEndpoint(uri);
+      }
+    }
+    final FlightStream stream = client.getStream(endpoint.getTicket(), options);
+    return new FlightStreamReaderAdapter(stream, client.getAllocator());
+  }
+
+  private ArrowReader openHttpEndpoint(URI uri) {
+    final HttpResponse<InputStream> response;
+    try {
+      response =
+          HTTP_CLIENT.send(
+              HttpRequest.newBuilder(uri).GET().build(), HttpResponse.BodyHandlers.ofInputStream());
+    } catch (final IOException e) {
+      throw CallStatus.UNAVAILABLE
+          .withDescription("Failed to fetch " + uri + ": " + e.getMessage())
+          .withCause(e)
+          .toRuntimeException();
+    } catch (final InterruptedException e) {
+      Thread.currentThread().interrupt();
+      throw CallStatus.CANCELLED.withCause(e).toRuntimeException();
+    }
+    if (response.statusCode() != 200) {
+      AutoCloseables.closeNoChecked(response.body());
+      throw CallStatus.INTERNAL
+          .withDescription("HTTP GET " + uri + " failed with status " + response.statusCode())
+          .toRuntimeException();
+    }
+    // The response body is closed when the returned reader is closed.
+    return new ArrowStreamReader(response.body(), client.getAllocator());
+  }
+
+  /**
+   * Execute via PollFlightInfo, falling back to GetFlightInfo for servers that do not implement
+   * polling (UNIMPLEMENTED), which preserves vanilla 19.0.0 behavior.
+   *
+   * <p>Poll semantics: the first call registers (and typically triggers) the query; a response
+   * still carrying a flight descriptor means the query is running and the client should poll again
+   * (with backoff, under a total deadline); a terminal response carries the final {@link
+   * FlightInfo}, whose endpoints may be addressed by non-gRPC locations (e.g. pre-signed URLs with
+   * empty tickets).
+   */
+  private static FlightInfo pollWithFallback(
+      final FlightClient client, final FlightDescriptor descriptor, final CallOption... options) {
+    PollInfo info;
+    try {
+      info = client.pollInfo(descriptor, options);
+    } catch (final FlightRuntimeException e) {
+      if (e.status().code() == FlightStatusCode.UNIMPLEMENTED) {
+        return client.getInfo(descriptor, options);
+      }
+      throw e;
+    }
+    final long deadline = System.currentTimeMillis() + POLL_TOTAL_DEADLINE_MS;
+    long backoff = POLL_INITIAL_BACKOFF_MS;
+    while (info.getFlightDescriptor().isPresent()) {
+      try {
+        Thread.sleep(backoff);
+      } catch (final InterruptedException e) {
+        Thread.currentThread().interrupt();
+        throw CallStatus.CANCELLED.withCause(e).toRuntimeException();
+      }
+      backoff = Math.min(backoff * 2, POLL_MAX_BACKOFF_MS);
+      if (System.currentTimeMillis() > deadline) {
+        throw CallStatus.TIMED_OUT
+            .withDescription(
+                "Query did not reach a terminal state within "
+                    + TimeUnit.MILLISECONDS.toMinutes(POLL_TOTAL_DEADLINE_MS)
+                    + " minutes of polling")
+            .toRuntimeException();
+      }
+      info = client.pollInfo(info.getFlightDescriptor().get(), options);
+    }
+    return info.getFlightInfo();
+  }
+
+  /** Adapts a gRPC {@link FlightStream} to the {@link ArrowReader} surface (per-batch copy). */
+  private static final class FlightStreamReaderAdapter extends ArrowReader {
+    private final FlightStream stream;
+    private VectorUnloader unloader;
+
+    FlightStreamReaderAdapter(FlightStream stream, BufferAllocator allocator) {
+      super(allocator);
+      this.stream = Preconditions.checkNotNull(stream);
+    }
+
+    @Override
+    protected Schema readSchema() {
+      return stream.getSchema();
+    }
+
+    @Override
+    public boolean loadNextBatch() throws IOException {
+      prepareLoadNextBatch();
+      final boolean hasNext;
+      try {
+        hasNext = stream.next();
+      } catch (final RuntimeException e) {
+        throw new IOException(e);
+      }
+      if (!hasNext) {
+        return false;
+      }
+      if (unloader == null) {
+        unloader = new VectorUnloader(stream.getRoot());
+      }
+      try (final ArrowRecordBatch batch = unloader.getRecordBatch()) {
+        loadRecordBatch(batch);
+      }
+      return true;
+    }
+
+    @Override
+    public long bytesRead() {
+      return 0;
+    }
+
+    @Override
+    protected void closeReadSource() throws IOException {
+      try {
+        stream.close();
+      } catch (final IOException e) {
+        throw e;
+      } catch (final Exception e) {
+        throw new IOException(e);
+      }
+    }
   }
 
   /**
@@ -1314,6 +1499,10 @@ public class FlightSqlClient implements AutoCloseable {
     /**
      * Executes the prepared statement query on the server.
      *
+     * <p>FG patch: executes via PollFlightInfo with fallback to GetFlightInfo on servers that do
+     * not implement polling, so long-running-query semantics and non-gRPC (e.g. pre-signed http)
+     * endpoints become reachable.
+     *
      * @param options RPC-layer hints for this call.
      * @return a FlightInfo object representing the stream(s) to fetch.
      */
@@ -1359,7 +1548,7 @@ public class FlightSqlClient implements AutoCloseable {
         }
       }
 
-      return client.getInfo(descriptor, options);
+      return pollWithFallback(client, descriptor, options);
     }
 
     private SyncPutListener putParameters(FlightDescriptor descriptor, CallOption... options) {

@@ -37,7 +37,6 @@ import java.util.concurrent.atomic.AtomicBoolean;
 import org.apache.arrow.driver.jdbc.client.CloseableEndpointStreamPair;
 import org.apache.arrow.flight.CallStatus;
 import org.apache.arrow.flight.FlightRuntimeException;
-import org.apache.arrow.flight.FlightStream;
 import org.apache.calcite.avatica.AvaticaConnection;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;

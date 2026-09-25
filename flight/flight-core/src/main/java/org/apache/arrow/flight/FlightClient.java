@@ -103,6 +103,16 @@ public class FlightClient implements AutoCloseable {
   }
 
   /**
+   * Get the allocator owned by this client.
+   *
+   * <p>Callers may use it to allocate buffers whose lifecycle is tied to results fetched through
+   * this client (e.g. readers for endpoints returned with non-gRPC locations).
+   */
+  public BufferAllocator getAllocator() {
+    return allocator;
+  }
+
+  /**
    * Get a list of available flights.
    *
    * @param criteria Criteria for selecting flights

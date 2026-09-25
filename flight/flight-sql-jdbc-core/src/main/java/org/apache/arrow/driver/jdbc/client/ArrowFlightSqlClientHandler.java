@@ -40,6 +40,7 @@ import org.apache.arrow.driver.jdbc.client.utils.FlightClientCache;
 import org.apache.arrow.driver.jdbc.client.utils.FlightLocationQueue;
 import org.apache.arrow.flight.CallOption;
 import org.apache.arrow.flight.CallStatus;
+import org.apache.arrow.flight.CancelFlightInfoRequest;
 import org.apache.arrow.flight.CloseSessionRequest;
 import org.apache.arrow.flight.FlightClient;
 import org.apache.arrow.flight.FlightClientMiddleware;
@@ -292,6 +293,17 @@ public final class ArrowFlightSqlClientHandler implements AutoCloseable {
     return sqlClient.execute(query, getOptions());
   }
 
+  /**
+   * Requests cancellation of the query identified by {@code info} (FG patch). Best effort: the
+   * server may report the query not cancelable (already completed); callers wiring {@code
+   * Statement.cancel()} should treat failures as non-fatal.
+   *
+   * @param info the FlightInfo captured as the cancel credential (carries the query id).
+   */
+  public void cancelFlightInfo(final FlightInfo info) {
+    sqlClient.cancelFlightInfo(new CancelFlightInfoRequest(info), getOptions());
+  }
+
   @Override
   public void close() throws SQLException {
     if (catalog.isPresent()) {
@@ -386,6 +398,19 @@ public final class ArrowFlightSqlClientHandler implements AutoCloseable {
     FlightInfo executeQuery() throws SQLException;
 
     /**
+     * Executes this {@link PreparedStatement}, forwarding {@code cancelCredentialListener} into the
+     * poll-based execute so statement layers can capture the CancelFlightInfo credential while the
+     * call is still blocked polling (FG patch).
+     *
+     * @param cancelCredentialListener optional consumer for the first FlightInfo eligible as a
+     *     CancelFlightInfo credential; must not throw.
+     * @return the {@link FlightInfo} representing the outcome of this query execution.
+     * @throws SQLException on error.
+     */
+    FlightInfo executeQuery(java.util.function.Consumer<FlightInfo> cancelCredentialListener)
+        throws SQLException;
+
+    /**
      * Executes a {@link StatementType#UPDATE} query.
      *
      * @return the number of rows affected.
@@ -471,7 +496,14 @@ public final class ArrowFlightSqlClientHandler implements AutoCloseable {
     return new PreparedStatement() {
       @Override
       public FlightInfo executeQuery() throws SQLException {
-        return preparedStatement.execute(getOptions());
+        return executeQuery(null);
+      }
+
+      @Override
+      public FlightInfo executeQuery(
+          final java.util.function.Consumer<FlightInfo> cancelCredentialListener)
+          throws SQLException {
+        return preparedStatement.execute(cancelCredentialListener, getOptions());
       }
 
       @Override

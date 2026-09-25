@@ -168,7 +168,7 @@ public class FlightSqlClient implements AutoCloseable {
     }
     final FlightDescriptor descriptor =
         FlightDescriptor.command(Any.pack(builder.build()).toByteArray());
-    return pollWithFallback(client, descriptor, options);
+    return pollWithFallback(client, descriptor, null, options);
   }
 
   /**
@@ -613,17 +613,34 @@ public class FlightSqlClient implements AutoCloseable {
    * (with backoff, under a total deadline); a terminal response carries the final {@link
    * FlightInfo}, whose endpoints may be addressed by non-gRPC locations (e.g. pre-signed URLs with
    * empty tickets).
+   *
+   * @param credentialListener optional; invoked exactly once, on the executing thread, with the
+   *     first FlightInfo eligible as a CancelFlightInfo credential (the first PollFlightInfo
+   *     response's FlightInfo, which carries the query id as application metadata, or the
+   *     GetFlightInfo fallback result). Note the first poll may be held server-side until the query
+   *     completes or the server's per-poll wait elapses, so the credential is not available before
+   *     that. The listener must not throw.
    */
   private static FlightInfo pollWithFallback(
-      final FlightClient client, final FlightDescriptor descriptor, final CallOption... options) {
+      final FlightClient client,
+      final FlightDescriptor descriptor,
+      final Consumer<FlightInfo> credentialListener,
+      final CallOption... options) {
     PollInfo info;
     try {
       info = client.pollInfo(descriptor, options);
     } catch (final FlightRuntimeException e) {
       if (e.status().code() == FlightStatusCode.UNIMPLEMENTED) {
-        return client.getInfo(descriptor, options);
+        final FlightInfo legacyInfo = client.getInfo(descriptor, options);
+        if (credentialListener != null) {
+          credentialListener.accept(legacyInfo);
+        }
+        return legacyInfo;
       }
       throw e;
+    }
+    if (credentialListener != null) {
+      credentialListener.accept(info.getFlightInfo());
     }
     final long deadline = System.currentTimeMillis() + POLL_TOTAL_DEADLINE_MS;
     long backoff = POLL_INITIAL_BACKOFF_MS;
@@ -1507,6 +1524,21 @@ public class FlightSqlClient implements AutoCloseable {
      * @return a FlightInfo object representing the stream(s) to fetch.
      */
     public FlightInfo execute(final CallOption... options) {
+      return execute(null, options);
+    }
+
+    /**
+     * Executes the prepared statement query on the server, notifying {@code
+     * cancelCredentialListener} with the first FlightInfo eligible as a CancelFlightInfo credential
+     * (see the poll-with-fallback helper). Lets statement layers wire {@code Statement.cancel()} to
+     * CancelFlightInfo while this call is still blocked polling.
+     *
+     * @param cancelCredentialListener optional; must not throw.
+     * @param options RPC-layer hints for this call.
+     * @return a FlightInfo object representing the stream(s) to fetch.
+     */
+    public FlightInfo execute(
+        final Consumer<FlightInfo> cancelCredentialListener, final CallOption... options) {
       checkOpen();
 
       FlightDescriptor descriptor =
@@ -1548,7 +1580,7 @@ public class FlightSqlClient implements AutoCloseable {
         }
       }
 
-      return pollWithFallback(client, descriptor, options);
+      return pollWithFallback(client, descriptor, cancelCredentialListener, options);
     }
 
     private SyncPutListener putParameters(FlightDescriptor descriptor, CallOption... options) {

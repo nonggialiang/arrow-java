@@ -20,13 +20,21 @@ import java.sql.SQLException;
 import org.apache.arrow.driver.jdbc.client.ArrowFlightSqlClientHandler.PreparedStatement;
 import org.apache.arrow.driver.jdbc.utils.ConvertUtils;
 import org.apache.arrow.flight.FlightInfo;
+import org.apache.arrow.flight.FlightRuntimeException;
 import org.apache.arrow.vector.types.pojo.Schema;
 import org.apache.calcite.avatica.AvaticaStatement;
 import org.apache.calcite.avatica.Meta;
 import org.apache.calcite.avatica.Meta.StatementHandle;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 /** A SQL statement for querying data from an Arrow Flight server. */
 public class ArrowFlightStatement extends AvaticaStatement implements ArrowFlightInfoStatement {
+
+  private static final Logger LOGGER = LoggerFactory.getLogger(ArrowFlightStatement.class);
+
+  /** FG patch: cancel credential captured from the first poll of the poll-based execute. */
+  private volatile FlightInfo cancelCredential;
 
   ArrowFlightStatement(
       final ArrowFlightConnection connection,
@@ -56,6 +64,45 @@ public class ArrowFlightStatement extends AvaticaStatement implements ArrowFligh
         ConvertUtils.convertArrowFieldsToColumnMetaDataList(resultSetSchema.getFields()));
     setSignature(signature);
 
-    return preparedStatement.executeQuery();
+    try {
+      return preparedStatement.executeQuery(this::recordCancelCredential);
+    } catch (final FlightRuntimeException e) {
+      // FG patch: surface poll-loop outcomes (CANCELLED, TIMED_OUT, ...) as SQLException.
+      throw new SQLException("Query execution failed.", e);
+    }
+  }
+
+  private void recordCancelCredential(final FlightInfo info) {
+    this.cancelCredential = info;
+  }
+
+  /**
+   * FG patch: while {@code executeQuery} is blocked polling, the Avatica-level cancel is a no-op
+   * (no result set exists yet), so forward CancelFlightInfo with the credential captured from the
+   * first poll before falling back to the standard behavior. Best effort: a server may not
+   * implement CancelFlightInfo or report the query not cancelable.
+   *
+   * <p>Must not be {@code synchronized}: the executing thread holds <em>this statement's</em>
+   * monitor for the whole poll-based execute (the Avatica {@code PrepareCallback} monitor is the
+   * statement itself, and {@code ArrowFlightMetaImpl} synchronizes on it around the execute).
+   * Before the credential exists (the first poll has not returned yet) {@code super.cancel()} is
+   * skipped altogether: the synchronized superclass method would block on that monitor until the
+   * poll loop exits, preventing the caller from retrying once the credential arrives at the first
+   * poll return. Its effect is replicated inline ({@code openResultSet} is null at that point).
+   */
+  @Override
+  public void cancel() throws SQLException {
+    final FlightInfo credential = cancelCredential;
+    if (credential != null) {
+      try {
+        getConnection().getClientHandler().cancelFlightInfo(credential);
+      } catch (final RuntimeException e) {
+        LOGGER.debug("Suppressed CancelFlightInfo failure during cancel", e);
+      }
+      super.cancel();
+    } else {
+      checkOpen();
+      cancelFlag.set(true);
+    }
   }
 }

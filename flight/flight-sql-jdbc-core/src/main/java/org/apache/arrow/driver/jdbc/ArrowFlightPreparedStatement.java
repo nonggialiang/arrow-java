@@ -20,20 +20,28 @@ import java.sql.PreparedStatement;
 import java.sql.SQLException;
 import org.apache.arrow.driver.jdbc.client.ArrowFlightSqlClientHandler;
 import org.apache.arrow.flight.FlightInfo;
+import org.apache.arrow.flight.FlightRuntimeException;
 import org.apache.arrow.util.Preconditions;
 import org.apache.calcite.avatica.AvaticaPreparedStatement;
 import org.apache.calcite.avatica.Meta.Signature;
 import org.apache.calcite.avatica.Meta.StatementHandle;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 /** Arrow Flight JBCS's implementation {@link PreparedStatement}. */
 public class ArrowFlightPreparedStatement extends AvaticaPreparedStatement
     implements ArrowFlightInfoStatement {
 
+  private static final Logger LOGGER = LoggerFactory.getLogger(ArrowFlightPreparedStatement.class);
+
   private final ArrowFlightSqlClientHandler.PreparedStatement preparedStatement;
+
+  /** FG patch: cancel credential captured from the first poll of the poll-based execute. */
+  private volatile FlightInfo cancelCredential;
 
   private ArrowFlightPreparedStatement(
       final ArrowFlightConnection connection,
-      final ArrowFlightSqlClientHandler.PreparedStatement preparedStatement,
+      final ArrowFlightSqlClientHandler.PreparedStatement preparedStmt,
       final StatementHandle handle,
       final Signature signature,
       final int resultSetType,
@@ -41,7 +49,7 @@ public class ArrowFlightPreparedStatement extends AvaticaPreparedStatement
       final int resultSetHoldability)
       throws SQLException {
     super(connection, handle, signature, resultSetType, resultSetConcurrency, resultSetHoldability);
-    this.preparedStatement = Preconditions.checkNotNull(preparedStatement);
+    this.preparedStatement = Preconditions.checkNotNull(preparedStmt);
   }
 
   static ArrowFlightPreparedStatement newPreparedStatement(
@@ -76,6 +84,40 @@ public class ArrowFlightPreparedStatement extends AvaticaPreparedStatement
 
   @Override
   public FlightInfo executeFlightInfoQuery() throws SQLException {
-    return preparedStatement.executeQuery();
+    try {
+      return preparedStatement.executeQuery(this::recordCancelCredential);
+    } catch (final FlightRuntimeException e) {
+      // FG patch: surface poll-loop outcomes (CANCELLED, TIMED_OUT, ...) as SQLException.
+      throw new SQLException("Query execution failed.", e);
+    }
+  }
+
+  private void recordCancelCredential(final FlightInfo info) {
+    this.cancelCredential = info;
+  }
+
+  /**
+   * FG patch: while {@code executeQuery} is blocked polling, the Avatica-level cancel is a no-op
+   * (no result set exists yet), so forward CancelFlightInfo with the credential captured from the
+   * first poll before falling back to the standard behavior. Best effort: a server may not
+   * implement CancelFlightInfo or report the query not cancelable.
+   *
+   * <p>Must not be {@code synchronized}, and {@code super.cancel()} is skipped before the
+   * credential exists (see {@link ArrowFlightStatement#cancel()}).
+   */
+  @Override
+  public void cancel() throws SQLException {
+    final FlightInfo credential = cancelCredential;
+    if (credential != null) {
+      try {
+        getConnection().getClientHandler().cancelFlightInfo(credential);
+      } catch (final RuntimeException e) {
+        LOGGER.debug("Suppressed CancelFlightInfo failure during cancel", e);
+      }
+      super.cancel();
+    } else {
+      checkOpen();
+      cancelFlag.set(true);
+    }
   }
 }

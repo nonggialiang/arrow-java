@@ -37,6 +37,10 @@ import org.checkerframework.checker.nullness.qual.Nullable;
 
 /** A {@link ConnectionConfig} for the {@link ArrowFlightConnection}. */
 public final class ArrowFlightConnectionConfigImpl extends ConnectionConfigImpl {
+
+  /** fg-p2：FG gateway 会话身份自报头（每连接生成，见 {@link #toCallOption()}）。 */
+  static final String HEADER_FG_SESSION_ID = "x-fg-session-id";
+
   public ArrowFlightConnectionConfigImpl(final Properties properties) {
     super(properties);
   }
@@ -191,6 +195,12 @@ public final class ArrowFlightConnectionConfigImpl extends ConnectionConfigImpl 
     final CallHeaders headers = new FlightCallHeaders();
     Map<String, String> headerAttributes = getHeaderAttributes();
     headerAttributes.forEach(headers::insert);
+    // fg-p2（FG gateway 严格会话身份）：每个 JDBC 连接自报 x-fg-session-id——网关拒绝
+    // 无身份请求（不铸造 cookie），驱动在建连时生成 UUID 并随本连接全部 RPC 携带。
+    // 用户经 URL 参数显式提供同名头时尊重之（此时同 URL 的多连接共享会话，属显式选择）。
+    if (headers.get(HEADER_FG_SESSION_ID) == null) {
+      headers.insert(HEADER_FG_SESSION_ID, java.util.UUID.randomUUID().toString());
+    }
     return new HeaderCallOption(headers);
   }
 

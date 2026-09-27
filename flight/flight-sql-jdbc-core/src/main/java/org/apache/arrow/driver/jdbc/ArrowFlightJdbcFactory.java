@@ -96,7 +96,7 @@ public class ArrowFlightJdbcFactory implements AvaticaFactory {
   }
 
   @Override
-  public ArrowFlightJdbcVectorSchemaRootResultSet newResultSet(
+  public org.apache.calcite.avatica.AvaticaResultSet newResultSet(
       final AvaticaStatement statement,
       final QueryState state,
       final Meta.Signature signature,
@@ -105,6 +105,18 @@ public class ArrowFlightJdbcFactory implements AvaticaFactory {
       throws SQLException {
     final ResultSetMetaData metaData = newResultSetMetaData(statement, signature);
 
+    // FG patch (D27): scrollable statements get the server-side paged ResultSet
+    if (statement instanceof ArrowFlightInfoStatement
+        && ((ArrowFlightInfoStatement) statement).isScrollable()) {
+      final org.apache.arrow.flight.FlightInfo info;
+      try {
+        info = ((ArrowFlightInfoStatement) statement).executeFlightInfoQuery();
+      } catch (final SQLException e) {
+        throw e;
+      }
+      return new ArrowFlightJdbcScrollResultSet(
+          statement, state, signature, metaData, timeZone, frame, info);
+    }
     return new ArrowFlightJdbcFlightStreamResultSet(
         statement, state, signature, metaData, timeZone, frame);
   }

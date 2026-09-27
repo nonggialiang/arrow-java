@@ -36,6 +36,9 @@ public class ArrowFlightStatement extends AvaticaStatement implements ArrowFligh
   /** FG patch: cancel credential captured from the first poll of the poll-based execute. */
   private volatile FlightInfo cancelCredential;
 
+  /** FG patch (D27): scrollable statements get server-side paged result sets. */
+  private final boolean scrollable;
+
   ArrowFlightStatement(
       final ArrowFlightConnection connection,
       final StatementHandle handle,
@@ -43,6 +46,20 @@ public class ArrowFlightStatement extends AvaticaStatement implements ArrowFligh
       final int resultSetConcurrency,
       final int resultSetHoldability) {
     super(connection, handle, resultSetType, resultSetConcurrency, resultSetHoldability);
+    this.scrollable = resultSetType != java.sql.ResultSet.TYPE_FORWARD_ONLY;
+  }
+
+  /** FG patch (D27): SENSITIVE requests are served as INSENSITIVE (snapshot semantics). */
+  @Override
+  public int getResultSetType() {
+    return scrollable
+        ? java.sql.ResultSet.TYPE_SCROLL_INSENSITIVE
+        : java.sql.ResultSet.TYPE_FORWARD_ONLY;
+  }
+
+  @Override
+  public boolean isScrollable() {
+    return scrollable;
   }
 
   @Override
@@ -64,8 +81,13 @@ public class ArrowFlightStatement extends AvaticaStatement implements ArrowFligh
         ConvertUtils.convertArrowFieldsToColumnMetaDataList(resultSetSchema.getFields()));
     setSignature(signature);
 
+    if (scrollable && getResultSetConcurrency() == java.sql.ResultSet.CONCUR_UPDATABLE) {
+      throw new SQLException("TYPE_SCROLL_INSENSITIVE requires CONCUR_READ_ONLY");
+    }
     try {
-      return preparedStatement.executeQuery(this::recordCancelCredential);
+      return scrollable
+          ? preparedStatement.executeQuery(this::recordCancelCredential, scrollHeaderOption())
+          : preparedStatement.executeQuery(this::recordCancelCredential);
     } catch (final FlightRuntimeException e) {
       // FG patch: surface poll-loop outcomes (CANCELLED, TIMED_OUT, ...) as SQLException.
       throw new SQLException("Query execution failed.", e);
@@ -74,6 +96,14 @@ public class ArrowFlightStatement extends AvaticaStatement implements ArrowFligh
 
   private void recordCancelCredential(final FlightInfo info) {
     this.cancelCredential = info;
+  }
+
+  /** FG patch (D27): header marking this execution as scrollable at the gateway. */
+  static org.apache.arrow.flight.CallOption scrollHeaderOption() {
+    final org.apache.arrow.flight.CallHeaders headers =
+        new org.apache.arrow.flight.FlightCallHeaders();
+    headers.insert("x-fg-result-set-type", "scroll");
+    return new org.apache.arrow.flight.HeaderCallOption(headers);
   }
 
   /**

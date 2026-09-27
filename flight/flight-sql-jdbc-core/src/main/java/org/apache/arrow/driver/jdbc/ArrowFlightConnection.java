@@ -161,6 +161,11 @@ public final class ArrowFlightConnection extends AvaticaConnection {
    *
    * @return the handler.
    */
+  /** FG patch (D27): root allocator accessor for the scrollable paged ResultSet. */
+  BufferAllocator getAllocator() {
+    return allocator;
+  }
+
   ArrowFlightSqlClientHandler getClientHandler() {
     return clientHandler;
   }

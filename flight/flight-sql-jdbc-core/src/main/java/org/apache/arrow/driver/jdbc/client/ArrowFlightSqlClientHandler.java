@@ -136,6 +136,21 @@ public final class ArrowFlightSqlClientHandler implements AutoCloseable {
   }
 
   /**
+   * FG patch (D27): raw ticket DoGet for scrollable (server-side paged) result sets — pages are
+   * addressed by re-presenting the endpoint STREAM ticket with paging headers. Extra options
+   * (auth/session headers come from the handler-wide options) are appended per call.
+   */
+  public org.apache.arrow.flight.FlightStream getStream(
+      final org.apache.arrow.flight.Ticket ticket,
+      final org.apache.arrow.flight.CallOption... extraOptions) {
+    final CallOption[] base = getOptions();
+    final CallOption[] merged = new CallOption[base.length + extraOptions.length];
+    System.arraycopy(base, 0, merged, 0, base.length);
+    System.arraycopy(extraOptions, 0, merged, base.length, extraOptions.length);
+    return sqlClient.getStream(ticket, merged);
+  }
+
+  /**
    * Makes an RPC "getStream" request based on the provided {@link FlightInfo} object. Retrieves the
    * result of the query previously prepared with "getInfo."
    *
@@ -411,6 +426,16 @@ public final class ArrowFlightSqlClientHandler implements AutoCloseable {
         throws SQLException;
 
     /**
+     * FG patch (D27): executes with additional per-RPC call options appended to the handler-wide
+     * options — scroll statements use this to attach {@code x-fg-result-set-type: scroll} at
+     * registration time.
+     */
+    FlightInfo executeQuery(
+        java.util.function.Consumer<FlightInfo> cancelCredentialListener,
+        org.apache.arrow.flight.CallOption... extraOptions)
+        throws SQLException;
+
+    /**
      * Executes a {@link StatementType#UPDATE} query.
      *
      * @return the number of rows affected.
@@ -504,6 +529,19 @@ public final class ArrowFlightSqlClientHandler implements AutoCloseable {
           final java.util.function.Consumer<FlightInfo> cancelCredentialListener)
           throws SQLException {
         return preparedStatement.execute(cancelCredentialListener, getOptions());
+      }
+
+      @Override
+      public FlightInfo executeQuery(
+          final java.util.function.Consumer<FlightInfo> cancelCredentialListener,
+          final org.apache.arrow.flight.CallOption... extraOptions)
+          throws SQLException {
+        final org.apache.arrow.flight.CallOption[] base = getOptions();
+        final org.apache.arrow.flight.CallOption[] merged =
+            new org.apache.arrow.flight.CallOption[base.length + extraOptions.length];
+        System.arraycopy(base, 0, merged, 0, base.length);
+        System.arraycopy(extraOptions, 0, merged, base.length, extraOptions.length);
+        return preparedStatement.execute(cancelCredentialListener, merged);
       }
 
       @Override

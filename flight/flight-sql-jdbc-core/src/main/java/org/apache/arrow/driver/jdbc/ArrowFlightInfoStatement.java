@@ -33,4 +33,12 @@ public interface ArrowFlightInfoStatement extends Statement {
    * @throws SQLException on error.
    */
   FlightInfo executeFlightInfoQuery() throws SQLException;
+
+  /**
+   * FG patch (D27): whether this statement was created with a scrollable result set type ({@code
+   * TYPE_SCROLL_INSENSITIVE}, or {@code TYPE_SCROLL_SENSITIVE} downgraded to it). Scroll statements
+   * register with the FG gateway header {@code x-fg-result-set-type: scroll} and get a server-side
+   * paged (random access) ResultSet instead of the default streaming one.
+   */
+  boolean isScrollable();
 }

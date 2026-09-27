@@ -50,6 +50,23 @@ public class ArrowFlightPreparedStatement extends AvaticaPreparedStatement
       throws SQLException {
     super(connection, handle, signature, resultSetType, resultSetConcurrency, resultSetHoldability);
     this.preparedStatement = Preconditions.checkNotNull(preparedStmt);
+    this.scrollable = resultSetType != java.sql.ResultSet.TYPE_FORWARD_ONLY;
+  }
+
+  /** FG patch (D27): scrollable statements get server-side paged result sets. */
+  private final boolean scrollable;
+
+  /** FG patch (D27): SENSITIVE requests are served as INSENSITIVE (snapshot semantics). */
+  @Override
+  public int getResultSetType() {
+    return scrollable
+        ? java.sql.ResultSet.TYPE_SCROLL_INSENSITIVE
+        : java.sql.ResultSet.TYPE_FORWARD_ONLY;
+  }
+
+  @Override
+  public boolean isScrollable() {
+    return scrollable;
   }
 
   static ArrowFlightPreparedStatement newPreparedStatement(
@@ -84,8 +101,14 @@ public class ArrowFlightPreparedStatement extends AvaticaPreparedStatement
 
   @Override
   public FlightInfo executeFlightInfoQuery() throws SQLException {
+    if (scrollable && getResultSetConcurrency() == java.sql.ResultSet.CONCUR_UPDATABLE) {
+      throw new SQLException("TYPE_SCROLL_INSENSITIVE requires CONCUR_READ_ONLY");
+    }
     try {
-      return preparedStatement.executeQuery(this::recordCancelCredential);
+      return scrollable
+          ? preparedStatement.executeQuery(
+              this::recordCancelCredential, ArrowFlightStatement.scrollHeaderOption())
+          : preparedStatement.executeQuery(this::recordCancelCredential);
     } catch (final FlightRuntimeException e) {
       // FG patch: surface poll-loop outcomes (CANCELLED, TIMED_OUT, ...) as SQLException.
       throw new SQLException("Query execution failed.", e);

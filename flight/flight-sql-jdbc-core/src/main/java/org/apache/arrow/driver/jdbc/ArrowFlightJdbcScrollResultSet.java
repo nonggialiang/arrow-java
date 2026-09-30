@@ -125,9 +125,9 @@ public class ArrowFlightJdbcScrollResultSet extends AvaticaResultSet {
   private final Schema schema;
 
   /**
-   * Avatica 生命周期（同 ArrowFlightJdbcFlightStreamResultSet）：构造器只捕获执行结果，
-   * 数据装配延迟到本方法——由 Avatica 的 PrepareCallback 在 execute() 时调用。覆盖基类
-   * 默认实现（其经 cursorFactory 路径，Arrow 签名的 cursorFactory 恒为 null 会 NPE）。
+   * Avatica 生命周期（同 ArrowFlightJdbcFlightStreamResultSet）：构造器只捕获执行结果， 数据装配延迟到本方法——由 Avatica 的
+   * PrepareCallback 在 execute() 时调用。覆盖基类 默认实现（其经 cursorFactory 路径，Arrow 签名的 cursorFactory 恒为 null 会
+   * NPE）。
    */
   @Override
   protected AvaticaResultSet execute() throws SQLException {

@@ -133,6 +133,11 @@ public final class ArrowFlightConnectionConfigImpl extends ConnectionConfigImpl 
     return ArrowFlightConnectionProperty.USE_ENCRYPTION.getBoolean(properties);
   }
 
+  /** FG patch: statement 默认 scroll 开关（无参 statement 重载强制 SCROLL_INSENSITIVE）。 */
+  public boolean statementDefaultScroll() {
+    return ArrowFlightConnectionProperty.STATEMENT_DEFAULT_SCROLL.getBoolean(properties);
+  }
+
   public boolean getDisableCertificateVerification() {
     return ArrowFlightConnectionProperty.CERTIFICATE_VERIFICATION.getBoolean(properties);
   }
@@ -277,6 +282,10 @@ public final class ArrowFlightConnectionConfigImpl extends ConnectionConfigImpl 
     CATALOG("catalog", null, Type.STRING, false),
     CONNECT_TIMEOUT_MILLIS("connectTimeoutMs", 10000, Type.NUMBER, false),
     USE_CLIENT_CACHE("useClientCache", true, Type.BOOLEAN, false),
+    // FG patch: statement 默认 scroll 开关——无参 createStatement/prepareStatement 强制
+    // TYPE_SCROLL_INSENSITIVE（= D27 服务端分页，每页一个短 DoGet；UI 客户端（DBeaver 等）
+    // 消除"一条打开的结果集泊住一个 relay 线程"的流式背压，资源模型对齐 Thrift fetch）
+    STATEMENT_DEFAULT_SCROLL("statementDefaultScroll", false, Type.BOOLEAN, false),
 
     // OAuth configuration properties
     OAUTH_FLOW("oauth.flow", null, Type.STRING, false),

@@ -71,15 +71,18 @@ public class ArrowFlightStatement extends AvaticaStatement implements ArrowFligh
   public FlightInfo executeFlightInfoQuery() throws SQLException {
     final PreparedStatement preparedStatement =
         getConnection().getMeta().getPreparedStatement(handle);
+    // FG patch（2026-10-01 DBeaver 实证）：signature 是 Avatica 的元数据增强载体，其字段
+    // 赋值时序在第三方执行流（DBeaver 自己的 execute 路径）下晚于本方法触发——null 时
+    // 跳过增强照常执行（原样提前返回 null 会连带跳过查询执行与 scroll 头签发，服务端
+    // 侧表现为"statement 未按 scrollable 落行"）。
     final Meta.Signature signature = getSignature();
-    if (signature == null) {
-      return null;
-    }
 
     final Schema resultSetSchema = preparedStatement.getDataSetSchema();
-    signature.columns.addAll(
-        ConvertUtils.convertArrowFieldsToColumnMetaDataList(resultSetSchema.getFields()));
-    setSignature(signature);
+    if (signature != null) {
+      signature.columns.addAll(
+          ConvertUtils.convertArrowFieldsToColumnMetaDataList(resultSetSchema.getFields()));
+      setSignature(signature);
+    }
 
     if (scrollable && getResultSetConcurrency() == java.sql.ResultSet.CONCUR_UPDATABLE) {
       throw new SQLException("TYPE_SCROLL_INSENSITIVE requires CONCUR_READ_ONLY");

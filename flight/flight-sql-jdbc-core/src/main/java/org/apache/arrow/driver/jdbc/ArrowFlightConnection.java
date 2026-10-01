@@ -19,8 +19,6 @@ package org.apache.arrow.driver.jdbc;
 import static org.apache.arrow.driver.jdbc.utils.ArrowFlightConnectionConfigImpl.ArrowFlightConnectionProperty.replaceSemiColons;
 
 import io.netty.util.concurrent.DefaultThreadFactory;
-import java.sql.PreparedStatement;
-import java.sql.ResultSet;
 import java.sql.SQLException;
 import java.util.ArrayList;
 import java.util.HashMap;
@@ -144,37 +142,15 @@ public final class ArrowFlightConnection extends AvaticaConnection {
   // ------------------------------------------------------------- FG patch: UI 客户端页式取数
 
   /**
-   * FG patch（D27 后续，方案 A）：{@code statementDefaultScroll=true} 时，无参 statement 重载强制 {@code
-   * TYPE_SCROLL_INSENSITIVE}——即 D27 服务端分页（注册带 x-fg-result-set-type: scroll，翻页 = 每页一个短 DoGet + 页头，驱动
-   * ArrowFlightJdbcScrollResultSet 自动附页参数）。
+   * FG patch（D27 后续，方案 A v2）：{@code statementDefaultScroll=true} 时 statement 默认 scroll。升级点在 {@link
+   * ArrowFlightJdbcFactory}（Avatica 所有 statement 创建的必经 通路）单点实现——覆盖无参
+   * createStatement/prepareStatement 及全部带参重载（DBeaver 实证：其执行语句经带参重载显式 FORWARD_ONLY，v1 无参覆写盖不住）。
    *
-   * <p>动机：UI 客户端（DBeaver 等）读满一页即停止拉行——流式 DoGet 下这是背压，泊住 一个 relay 线程直至 readiness 超时；页式把资源模型对齐 Thrift
-   * fetch（Kyuubi/Hive JDBC 无此问题的原因）：页间无在途 RPC、服务端零泊住线程、结果在对象存储里等。
-   *
-   * <p>边界（有意设计）：① 默认 false，未设置的连接行为零变化；② 仅升级<b>无参</b>重载 ——应用显式传 resultSetType（含
-   * FORWARD_ONLY）的语句不受影响，流式自我声明仍有效； ③ 页大小 = Statement.getFetchSize()（未设 = 网关默认 1000，上限 clamp
-   * 65536）； ④ 全量顺序扫描（ETL）与 https presign 直取场景<b>不建议</b>开启（页式逐页 RPC 慢于 单流；scroll 强制 relay，presign
-   * 永不生效）。
+   * <p>语义：flag = <b>连接级策略</b>——开启后 FORWARD_ONLY（显式或默认）一律升级 SCROLL_INSENSITIVE；显式 SCROLL 类型不变；逃生舱 =
+   * 不开 flag 的连接（流式）。 动机与边界见 factory 内注释。
    */
-  @Override
-  public org.apache.calcite.avatica.AvaticaStatement createStatement() throws SQLException {
-    if (config.statementDefaultScroll()) {
-      // Avatica 的 (int,int) 重载返回 Statement、无参重载返回 AvaticaStatement（协变）；
-      // 工厂实际产出 AvaticaStatement（ArrowFlightStatement），窄化安全
-      return (org.apache.calcite.avatica.AvaticaStatement)
-          super.createStatement(ResultSet.TYPE_SCROLL_INSENSITIVE, ResultSet.CONCUR_READ_ONLY);
-    }
-    return super.createStatement();
-  }
-
-  /** 同 {@link #createStatement()}：无参 prepareStatement 升级 scroll（见其 javadoc）。 */
-  @Override
-  public PreparedStatement prepareStatement(String sql) throws SQLException {
-    if (config.statementDefaultScroll()) {
-      return super.prepareStatement(
-          sql, ResultSet.TYPE_SCROLL_INSENSITIVE, ResultSet.CONCUR_READ_ONLY);
-    }
-    return super.prepareStatement(sql);
+  boolean statementDefaultScroll() {
+    return config.statementDefaultScroll();
   }
 
   void reset() throws SQLException {

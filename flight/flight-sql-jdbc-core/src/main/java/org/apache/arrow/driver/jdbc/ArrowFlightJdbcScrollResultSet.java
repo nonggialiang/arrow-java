@@ -19,9 +19,7 @@ package org.apache.arrow.driver.jdbc;
 import java.sql.ResultSetMetaData;
 import java.sql.SQLException;
 import java.util.Calendar;
-import java.util.LinkedHashMap;
 import java.util.List;
-import java.util.Map;
 import java.util.TimeZone;
 import org.apache.arrow.driver.jdbc.utils.ConvertUtils;
 import org.apache.arrow.flight.CallHeaders;
@@ -67,25 +65,20 @@ public class ArrowFlightJdbcScrollResultSet extends AvaticaResultSet {
       LoggerFactory.getLogger(ArrowFlightJdbcScrollResultSet.class);
 
   private static final int DEFAULT_PAGE_SIZE = 1000;
-  private static final int PAGE_CACHE_LIMIT = 8;
 
   private final ArrowFlightInfoStatement statement;
   private final byte[] ticketBytes;
   private final long totalRows;
   private final int pageSize;
 
-  /** LRU of fetched pages keyed by page start offset; eviction closes the batch. */
-  private final LinkedHashMap<Long, ArrowRecordBatch> pageCache =
-      new LinkedHashMap<Long, ArrowRecordBatch>(16, 0.75f, true) {
-        @Override
-        protected boolean removeEldestEntry(final Map.Entry<Long, ArrowRecordBatch> eldest) {
-          if (size() > PAGE_CACHE_LIMIT) {
-            eldest.getValue().close();
-            return true;
-          }
-          return false;
-        }
-      };
+  /**
+   * 页缓存走 {@link ArrowFlightConnection} 连接级共享（key=queryId:pageStart，界 64 页）： UI
+   * 客户端（DBeaver）段式取数是"重执行 + 从行 1 顺序重读"（实证 2026-10-01，不用 absolute 跳段）——实例级缓存在重执行下必 miss；scroll
+   * 快照不可变，按 queryId 跨实例 共享后重读页全部命中，仅真正新页打网关。batch 归属共享缓存（驱逐时关闭），本实例 只持有装载目标 root。
+   */
+  private final ArrowFlightConnection conn;
+
+  private final String queryId;
 
   /** The single root accessors are bound to; the current page is (re)loaded into it. */
   private VectorSchemaRoot root;
@@ -107,10 +100,18 @@ public class ArrowFlightJdbcScrollResultSet extends AvaticaResultSet {
       throws SQLException {
     super(statement, state, signature, resultSetMetaData, timeZone, firstFrame);
     this.statement = (ArrowFlightInfoStatement) statement;
+    this.conn = this.statement.getConnection();
     if (info.getEndpoints().isEmpty() || info.getEndpoints().get(0).getTicket() == null) {
       throw new SQLException("Scrollable execution returned no ticket endpoint");
     }
     this.ticketBytes = info.getEndpoints().get(0).getTicket().getBytes();
+    // D27：终态 FlightInfo 的 appMetadata = queryId（重执行指纹去重后不变——连接级
+    // 缓存键稳定）；缺席（异常态）回落 ticket 哈希（仅实例内共享）
+    byte[] appMetadata = info.getAppMetadata();
+    this.queryId =
+        appMetadata != null && appMetadata.length > 0
+            ? new String(appMetadata, java.nio.charset.StandardCharsets.UTF_8)
+            : "ticket-" + java.util.Arrays.hashCode(this.ticketBytes);
     this.totalRows = Math.max(0L, info.getRecords());
     int fetchSize;
     try {
@@ -248,10 +249,10 @@ public class ArrowFlightJdbcScrollResultSet extends AvaticaResultSet {
     if (pageStart == loadedPageStart) {
       return;
     }
-    ArrowRecordBatch batch = pageCache.get(pageStart);
+    ArrowRecordBatch batch = conn.scrollPageGet(queryId, pageStart);
     if (batch == null) {
       batch = fetchPage(pageStart);
-      pageCache.put(pageStart, batch);
+      conn.scrollPagePut(queryId, pageStart, batch);
     }
     loader.load(batch);
     loadedPageStart = pageStart;
@@ -326,14 +327,7 @@ public class ArrowFlightJdbcScrollResultSet extends AvaticaResultSet {
 
   @Override
   public void close() {
-    for (final ArrowRecordBatch batch : pageCache.values()) {
-      try {
-        batch.close();
-      } catch (final Exception e) {
-        LOGGER.debug("Suppressed page close failure", e);
-      }
-    }
-    pageCache.clear();
+    // 页 batch 归连接级共享缓存（LRU 驱逐时关闭），本实例不关闭
     if (root != null) {
       root.close();
     }

@@ -22,6 +22,7 @@ import io.netty.util.concurrent.DefaultThreadFactory;
 import java.sql.SQLException;
 import java.util.ArrayList;
 import java.util.HashMap;
+import java.util.LinkedHashMap;
 import java.util.Map;
 import java.util.Properties;
 import java.util.concurrent.ExecutorService;
@@ -153,6 +154,67 @@ public final class ArrowFlightConnection extends AvaticaConnection {
     return config.statementDefaultScroll();
   }
 
+  private final ScrollPageCache scrollPageCache = new ScrollPageCache();
+
+  /**
+   * 连接级 scroll 页缓存（2026-10-01 DBeaver 实证）：scroll 结果是不可变快照（物化在 网关对象存储），页按 queryId 跨 ResultSet
+   * 实例共享——UI 客户端（DBeaver）段式取数 是"重执行 + 从行 1 顺序重读"（不用 absolute 跳段），重读页全部内存命中、仅真正新页 打网关。界 64 页（LRU 驱逐关
+   * batch）。
+   */
+  org.apache.arrow.vector.ipc.message.ArrowRecordBatch scrollPageGet(
+      String queryId, long pageStart) {
+    return scrollPageCache.get(queryId, pageStart);
+  }
+
+  void scrollPagePut(
+      String queryId, long pageStart, org.apache.arrow.vector.ipc.message.ArrowRecordBatch batch) {
+    scrollPageCache.put(queryId, pageStart, batch);
+  }
+
+  /** 有界 LRU：key = queryId:pageStart；驱逐关闭 batch（快照不可变，跨实例共享安全）。 */
+  private static final class ScrollPageCache {
+    private static final int MAX_PAGES = 64;
+    private final LinkedHashMap<String, org.apache.arrow.vector.ipc.message.ArrowRecordBatch>
+        pages =
+            new LinkedHashMap<>(16, 0.75f, true) {
+              @Override
+              protected boolean removeEldestEntry(
+                  final Map.Entry<String, org.apache.arrow.vector.ipc.message.ArrowRecordBatch>
+                      eldest) {
+                if (size() > MAX_PAGES) {
+                  eldest.getValue().close();
+                  return true;
+                }
+                return false;
+              }
+            };
+
+    synchronized org.apache.arrow.vector.ipc.message.ArrowRecordBatch get(
+        String queryId, long pageStart) {
+      return pages.get(queryId + ":" + pageStart);
+    }
+
+    synchronized void put(
+        String queryId,
+        long pageStart,
+        org.apache.arrow.vector.ipc.message.ArrowRecordBatch batch) {
+      pages.put(queryId + ":" + pageStart, batch);
+    }
+
+    synchronized void closeAll() {
+      pages
+          .values()
+          .forEach(
+              b -> {
+                try {
+                  b.close();
+                } catch (final Exception ignored) {
+                }
+              });
+      pages.clear();
+    }
+  }
+
   void reset() throws SQLException {
     // Clean up any open Statements
     try {
@@ -231,6 +293,7 @@ public final class ArrowFlightConnection extends AvaticaConnection {
 
   @Override
   public void close() throws SQLException {
+    scrollPageCache.closeAll(); // 共享 scroll 页 batch 归连接（LRU/关闭时释放）
     Exception topLevelException = null;
     try {
       if (executorService != null) {

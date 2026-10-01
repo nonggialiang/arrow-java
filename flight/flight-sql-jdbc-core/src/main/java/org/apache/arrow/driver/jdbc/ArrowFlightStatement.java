@@ -39,6 +39,14 @@ public class ArrowFlightStatement extends AvaticaStatement implements ArrowFligh
   /** FG patch (D27): scrollable statements get server-side paged result sets. */
   private final boolean scrollable;
 
+  /** FG patch (D28): segment 对齐页大小（executeFlightInfoQuery 推导，ScrollResultSet 消费）。 */
+  private volatile int fgPageSizeHint;
+
+  @Override
+  public int pageSizeHint() {
+    return fgPageSizeHint;
+  }
+
   ArrowFlightStatement(
       final ArrowFlightConnection connection,
       final StatementHandle handle,
@@ -87,13 +95,74 @@ public class ArrowFlightStatement extends AvaticaStatement implements ArrowFligh
     if (scrollable && getResultSetConcurrency() == java.sql.ResultSet.CONCUR_UPDATABLE) {
       throw new SQLException("TYPE_SCROLL_INSENSITIVE requires CONCUR_READ_ONLY");
     }
+    // FG patch（D28 显式续传）：statementDefaultScroll 连接上以单槽判定"段式下拉续传"
+    // （同 SQL 且 maxRows 增长——DBeaver setLimit(offset, segment) 的 JDBC 泄漏信号）vs
+    // "新执行"（fresh nonce → 网关 ② 直建行，queryId 即客户端铸造值）。执行后记录槽。
+    final ArrowFlightConnection conn = getConnection();
+    final String pending = conn.pendingSql(handle);
+    final String sql = pending != null ? pending : sqlOfSignature();
+    org.apache.arrow.flight.CallOption queryIdOption = null;
+    int maxRows = 0;
     try {
-      return scrollable
-          ? preparedStatement.executeQuery(this::recordCancelCredential, scrollHeaderOption())
-          : preparedStatement.executeQuery(this::recordCancelCredential);
+      maxRows = getMaxRows();
+    } catch (Exception ignored) {
+      // Avatica 字段读取不应失败；防御
+    }
+    if (conn.statementDefaultScroll() && sql != null) {
+      final String continuationId = conn.queryIdForContinuation(sql, maxRows);
+      final String headerId =
+          continuationId != null ? continuationId : java.util.UUID.randomUUID().toString();
+      final int segment =
+          continuationId != null && maxRows > 0 ? maxRows - lastMaxRowsFor(conn) : maxRows;
+      fgPageSizeHint = segment > 0 ? Math.min(segment, 65536) : 0;
+      final org.apache.arrow.flight.CallHeaders headers =
+          new org.apache.arrow.flight.FlightCallHeaders();
+      headers.insert("x-fg-query-id", headerId);
+      queryIdOption = new org.apache.arrow.flight.HeaderCallOption(headers);
+    }
+    try {
+      final org.apache.arrow.flight.FlightInfo info;
+      if (scrollable && queryIdOption != null) {
+        info =
+            preparedStatement.executeQuery(
+                this::recordCancelCredential, scrollHeaderOption(), queryIdOption);
+      } else if (scrollable) {
+        info = preparedStatement.executeQuery(this::recordCancelCredential, scrollHeaderOption());
+      } else if (queryIdOption != null) {
+        info = preparedStatement.executeQuery(this::recordCancelCredential, queryIdOption);
+      } else {
+        info = preparedStatement.executeQuery(this::recordCancelCredential);
+      }
+      if (conn.statementDefaultScroll() && sql != null) {
+        conn.recordExecution(sql, queryIdOf(info), maxRows);
+      }
+      return info;
     } catch (final FlightRuntimeException e) {
       // FG patch: surface poll-loop outcomes (CANCELLED, TIMED_OUT, ...) as SQLException.
       throw new SQLException("Query execution failed.", e);
+    }
+  }
+
+  /** 槽内 lastMaxRows 只读视图（pageSize 推导用；-1 = 无槽）。 */
+  private static int lastMaxRowsFor(ArrowFlightConnection conn) {
+    return conn.lastMaxRowsSnapshot();
+  }
+
+  /** FlightInfo.appMetadata = queryId（FG 网关约定；缺席回落 null）。 */
+  private static String queryIdOf(org.apache.arrow.flight.FlightInfo info) {
+    final byte[] meta = info.getAppMetadata();
+    return meta != null && meta.length > 0
+        ? new String(meta, java.nio.charset.StandardCharsets.UTF_8)
+        : null;
+  }
+
+  /** signature.sql 兜底（pendingSql 通道缺失时）。 */
+  private String sqlOfSignature() {
+    try {
+      final Meta.Signature sig = getSignature();
+      return sig == null ? null : sig.sql;
+    } catch (Exception e) {
+      return null;
     }
   }
 

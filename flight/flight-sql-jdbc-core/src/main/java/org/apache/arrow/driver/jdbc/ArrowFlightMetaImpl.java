@@ -174,6 +174,9 @@ public class ArrowFlightMetaImpl extends MetaImpl {
   }
 
   private PreparedStatement prepareForHandle(final String query, StatementHandle handle) {
+    // FG patch（D28）：handle→SQL 侧通道（DBeaver 执行流下 signature 赋值晚于
+    // executeFlightInfoQuery，statement 侧经 pendingSql 拿到可靠 SQL 文本）
+    ((ArrowFlightConnection) connection).recordPendingSql(handle, query);
     final PreparedStatement preparedStatement =
         ((ArrowFlightConnection) connection).getClientHandler().prepare(query);
     handle.signature =
@@ -216,6 +219,10 @@ public class ArrowFlightMetaImpl extends MetaImpl {
 
       final long updateCount =
           statementType.equals(StatementType.UPDATE) ? preparedStatement.executeUpdate() : -1;
+      // FG patch（D28）：副作用语句成功执行后清续传槽（读己之写防御）
+      if (statementType.equals(StatementType.UPDATE)) {
+        ((ArrowFlightConnection) connection).invalidateLastExecution();
+      }
       synchronized (callback.getMonitor()) {
         callback.clear();
         callback.assign(handle.signature, null, updateCount);

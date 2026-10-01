@@ -41,4 +41,12 @@ public interface ArrowFlightInfoStatement extends Statement {
    * paged (random access) ResultSet instead of the default streaming one.
    */
   boolean isScrollable();
+
+  /**
+   * FG patch (D28): DBeaver segment 对齐的页大小提示（statementDefaultScroll 连接上由 executeFlightInfoQuery
+   * 推导：fresh = maxRows / 续传 = maxRows - lastMaxRows）。 0 = 无提示（ScrollResultSet 回落 fetchSize/网关默认）。
+   */
+  default int pageSizeHint() {
+    return 0;
+  }
 }

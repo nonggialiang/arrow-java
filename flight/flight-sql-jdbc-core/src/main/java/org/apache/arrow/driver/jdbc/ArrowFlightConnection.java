@@ -22,7 +22,6 @@ import io.netty.util.concurrent.DefaultThreadFactory;
 import java.sql.SQLException;
 import java.util.ArrayList;
 import java.util.HashMap;
-import java.util.LinkedHashMap;
 import java.util.Map;
 import java.util.Properties;
 import java.util.concurrent.ExecutorService;
@@ -154,65 +153,56 @@ public final class ArrowFlightConnection extends AvaticaConnection {
     return config.statementDefaultScroll();
   }
 
-  private final ScrollPageCache scrollPageCache = new ScrollPageCache();
+  // ------------------------------------------------------------- FG patch: D28 单槽续传
+  // statementDefaultScroll=true 的连接上，fork 驱动以 (lastSql, lastQueryId, lastMaxRows)
+  // 单槽区分"段式下拉续传"（同 SQL 且 maxRows 增长——DBeaver setLimit(offset, segment) 的
+  // JDBC 泄漏信号）与"新执行"（重跑 SQL）。executeUpdate 成功后整槽清空（读己之写防御）。
+  private String lastSql;
+  private String lastQueryId;
+  private int lastMaxRows;
 
-  /**
-   * 连接级 scroll 页缓存（2026-10-01 DBeaver 实证）：scroll 结果是不可变快照（物化在 网关对象存储），页按 queryId 跨 ResultSet
-   * 实例共享——UI 客户端（DBeaver）段式取数 是"重执行 + 从行 1 顺序重读"（不用 absolute 跳段），重读页全部内存命中、仅真正新页 打网关。界 64 页（LRU 驱逐关
-   * batch）。
-   */
-  org.apache.arrow.vector.ipc.message.ArrowRecordBatch scrollPageGet(
-      String queryId, long pageStart) {
-    return scrollPageCache.get(queryId, pageStart);
+  /** 续传判定（DBeaver 语义：N = offset + segment，增长即下拉）。返回 lastQueryId 或 null。 */
+  synchronized String queryIdForContinuation(String sql, int maxRows) {
+    if (sql == null || lastSql == null || lastQueryId == null) {
+      return null;
+    }
+    if (lastMaxRows > 0 && maxRows > lastMaxRows && sql.trim().equals(lastSql)) {
+      return lastQueryId;
+    }
+    return null;
   }
 
-  void scrollPagePut(
-      String queryId, long pageStart, org.apache.arrow.vector.ipc.message.ArrowRecordBatch batch) {
-    scrollPageCache.put(queryId, pageStart, batch);
+  /** 执行后记录槽（queryId 优先取响应 appMetadata = 网关权威 id）。 */
+  synchronized void recordExecution(String sql, String queryId, int maxRows) {
+    this.lastSql = sql == null ? null : sql.trim();
+    this.lastQueryId = queryId;
+    this.lastMaxRows = maxRows;
   }
 
-  /** 有界 LRU：key = queryId:pageStart；驱逐关闭 batch（快照不可变，跨实例共享安全）。 */
-  private static final class ScrollPageCache {
-    private static final int MAX_PAGES = 64;
-    private final LinkedHashMap<String, org.apache.arrow.vector.ipc.message.ArrowRecordBatch>
-        pages =
-            new LinkedHashMap<>(16, 0.75f, true) {
-              @Override
-              protected boolean removeEldestEntry(
-                  final Map.Entry<String, org.apache.arrow.vector.ipc.message.ArrowRecordBatch>
-                      eldest) {
-                if (size() > MAX_PAGES) {
-                  eldest.getValue().close();
-                  return true;
-                }
-                return false;
-              }
-            };
+  /** 槽内 lastMaxRows 只读快照（pageSize 推导用；0 = 无槽）。 */
+  synchronized int lastMaxRowsSnapshot() {
+    return lastMaxRows;
+  }
 
-    synchronized org.apache.arrow.vector.ipc.message.ArrowRecordBatch get(
-        String queryId, long pageStart) {
-      return pages.get(queryId + ":" + pageStart);
-    }
+  /** executeUpdate 成功后清槽（同 SQL + maxRows 增长的窄边缘读己之写防御）。 */
+  synchronized void invalidateLastExecution() {
+    lastSql = null;
+    lastQueryId = null;
+    lastMaxRows = 0;
+  }
 
-    synchronized void put(
-        String queryId,
-        long pageStart,
-        org.apache.arrow.vector.ipc.message.ArrowRecordBatch batch) {
-      pages.put(queryId + ":" + pageStart, batch);
-    }
+  /** D28：prepareForHandle 侧记录 handle→SQL（DBeaver 流程下 signature 赋值晚于执行触发）。 */
+  private final java.util.concurrent.ConcurrentHashMap<Integer, String> pendingSqlByHandle =
+      new java.util.concurrent.ConcurrentHashMap<>();
 
-    synchronized void closeAll() {
-      pages
-          .values()
-          .forEach(
-              b -> {
-                try {
-                  b.close();
-                } catch (final Exception ignored) {
-                }
-              });
-      pages.clear();
+  void recordPendingSql(org.apache.calcite.avatica.Meta.StatementHandle handle, String sql) {
+    if (handle != null && sql != null) {
+      pendingSqlByHandle.put(handle.id, sql);
     }
+  }
+
+  String pendingSql(org.apache.calcite.avatica.Meta.StatementHandle handle) {
+    return handle == null ? null : pendingSqlByHandle.remove(handle.id);
   }
 
   void reset() throws SQLException {
@@ -293,7 +283,6 @@ public final class ArrowFlightConnection extends AvaticaConnection {
 
   @Override
   public void close() throws SQLException {
-    scrollPageCache.closeAll(); // 共享 scroll 页 batch 归连接（LRU/关闭时释放）
     Exception topLevelException = null;
     try {
       if (executorService != null) {

@@ -56,6 +56,14 @@ public class ArrowFlightPreparedStatement extends AvaticaPreparedStatement
   /** FG patch (D27): scrollable statements get server-side paged result sets. */
   private final boolean scrollable;
 
+  /** FG patch (D28): segment 对齐页大小（同 ArrowFlightStatement）。 */
+  private volatile int fgPageSizeHint;
+
+  @Override
+  public int pageSizeHint() {
+    return fgPageSizeHint;
+  }
+
   /** FG patch (D27): SENSITIVE requests are served as INSENSITIVE (snapshot semantics). */
   @Override
   public int getResultSetType() {
@@ -104,11 +112,55 @@ public class ArrowFlightPreparedStatement extends AvaticaPreparedStatement
     if (scrollable && getResultSetConcurrency() == java.sql.ResultSet.CONCUR_UPDATABLE) {
       throw new SQLException("TYPE_SCROLL_INSENSITIVE requires CONCUR_READ_ONLY");
     }
+    final ArrowFlightConnection conn = getConnection();
+    final String pending = conn.pendingSql(handle);
+    final String sql =
+        pending != null ? pending : (getSignature() == null ? null : getSignature().sql);
+    org.apache.arrow.flight.CallOption queryIdOption = null;
+    int maxRows = 0;
     try {
-      return scrollable
-          ? preparedStatement.executeQuery(
-              this::recordCancelCredential, ArrowFlightStatement.scrollHeaderOption())
-          : preparedStatement.executeQuery(this::recordCancelCredential);
+      maxRows = getMaxRows();
+    } catch (Exception ignored) {
+    }
+    if (conn.statementDefaultScroll() && sql != null) {
+      final String continuationId = conn.queryIdForContinuation(sql, maxRows);
+      final String headerId =
+          continuationId != null ? continuationId : java.util.UUID.randomUUID().toString();
+      final int segment =
+          continuationId != null && maxRows > 0 ? maxRows - conn.lastMaxRowsSnapshot() : maxRows;
+      fgPageSizeHint = segment > 0 ? Math.min(segment, 65536) : 0;
+      final org.apache.arrow.flight.CallHeaders headers =
+          new org.apache.arrow.flight.FlightCallHeaders();
+      headers.insert("x-fg-query-id", headerId);
+      queryIdOption = new org.apache.arrow.flight.HeaderCallOption(headers);
+    }
+    try {
+      final org.apache.arrow.flight.FlightInfo info;
+      if (queryIdOption != null && scrollable) {
+        info =
+            preparedStatement.executeQuery(
+                this::recordCancelCredential,
+                ArrowFlightStatement.scrollHeaderOption(),
+                queryIdOption);
+      } else if (queryIdOption != null) {
+        info = preparedStatement.executeQuery(this::recordCancelCredential, queryIdOption);
+      } else if (scrollable) {
+        info =
+            preparedStatement.executeQuery(
+                this::recordCancelCredential, ArrowFlightStatement.scrollHeaderOption());
+      } else {
+        info = preparedStatement.executeQuery(this::recordCancelCredential);
+      }
+      if (conn.statementDefaultScroll() && sql != null) {
+        final byte[] meta = info.getAppMetadata();
+        conn.recordExecution(
+            sql,
+            meta != null && meta.length > 0
+                ? new String(meta, java.nio.charset.StandardCharsets.UTF_8)
+                : null,
+            maxRows);
+      }
+      return info;
     } catch (final FlightRuntimeException e) {
       // FG patch: surface poll-loop outcomes (CANCELLED, TIMED_OUT, ...) as SQLException.
       throw new SQLException("Query execution failed.", e);

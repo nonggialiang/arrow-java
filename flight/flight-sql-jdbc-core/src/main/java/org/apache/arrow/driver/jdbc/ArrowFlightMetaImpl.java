@@ -236,6 +236,11 @@ public class ArrowFlightMetaImpl extends MetaImpl {
       // Runtime
       // Exceptions.
       throw new RuntimeException(e);
+    } catch (FgTerminalQueryException e) {
+      // FG patch (fg-p5/D30)：终态失败（取消/引擎失败/SQL与认证错）直达应用——绕过
+      // NoSuchStatementException 触发的 Avatica 重试环（executeInternal 对
+      // RuntimeException 的处理是包成 SQLException 抛出，不重试）
+      throw new RuntimeException(e);
     } catch (SQLException e) {
       throw new NoSuchStatementException(handle);
     }

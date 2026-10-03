@@ -29,36 +29,32 @@ import java.util.Properties;
 import java.util.Random;
 
 /**
- * FG (flight-gateway) JDBC client sample (D29).
+ * FG (flight-gateway) JDBC client sample (D29, simplified by fg-p5/D30).
  *
  * <p>用 FG 定制驱动（本 fork，{@code 19.0.0-fg-p1}）连接 flight-gateway 执行 Spark SQL：
  *
  * <ol>
  *   <li>{@code CREATE OR REPLACE TEMPORARY VIEW ... USING parquet OPTIONS (path 's3a://...')}
- *       —— 走网关命令路径；临时 view 是<b>会话级</b>对象，两个模式必须落在同一个 fg 会话。
+ *       —— 走网关命令路径；临时 view 是<b>会话级</b>对象，两个模式共用同一条连接。
  *   <li>模式一（流式）：默认连接（无参 statement = {@code TYPE_FORWARD_ONLY}），
  *       {@code next()} 逐行消费到底——单次 DoGet 中继流，统计首行耗时与「第一条消费到
  *       最后一条」的整体耗时。
- *   <li>模式二（随机分页）：{@code statementDefaultScroll=true} 连接上<b>重执行</b>同一
- *       SELECT——驱动按 D28 显式协议铸造 fresh nonce {@code x-fg-query-id}（与模式一
- *       必然不同 id，网关 ② 直建新行、不走同 session 同 SQL 指纹复用），scrollable 落行
- *       + 服务端页切片（D27）；按模式一行数随机页序 {@code absolute(offset)} 跳页，每页
- *       fetchSize 行，统计重执行耗时、平均每页耗时与整体耗时；首列校验和与模式一比对
- *       （页序无关的求和），验证随机页数据一致。
+ *   <li>模式二（随机分页）：同一默认连接上显式 {@code TYPE_SCROLL_INSENSITIVE} statement
+ *       <b>重执行</b>同一 SELECT——fg-p5 起默认连接每次应用级 execute 自动铸造 fresh nonce
+ *       {@code x-fg-query-id}（与模式一必然不同 id，网关 ② 直建 scrollable 新行、不走同
+ *       session 同 SQL 指纹复用，引擎真重跑）+ 服务端页切片（D27）；按模式一行数随机页序
+ *       {@code absolute(offset)} 跳页，每页 fetchSize 行，统计重执行耗时、平均每页耗时与
+ *       整体耗时；首列校验和与模式一比对（页序无关的求和），验证随机页数据一致。
  * </ol>
  *
- * <p><b>两条连接共享会话</b>：样例自铸 sessionId 并经 URL 参数 {@code x-fg-session-id}
- * 显式钉给两条连接（驱动契约：显式提供即尊重，多连接共享会话）。为何两条连接——
- * {@code x-fg-query-id} 只在 statementDefaultScroll 连接上携带，而该连接所有 statement
- * 都升级 scroll（v2 连接级策略）；真流式（模式一）与显式 queryId 协议（模式二）因此
- * 只能各占一条连接。若两条连接都走默认（无头）路径重执行同 SQL，会命中网关指纹终态
- * 复用（同 session 同 SQL，设计行为）——复用响应仍是首注册的 PART 扇出票，页头对
- * PART 票不切片，每页 DoGet 会拉回整个 part（D29 实证：每页回全量 + 驱动 mismatch
- * 告警）；显式 queryId 是正解。
+ * <p><b>历史注记</b>：fg-p5 之前默认连接不带 queryId 头，重执行同 SQL 命中网关指纹终态
+ * 复用（设计行为）——复用响应是首注册的 PART 扇出票，页头对 PART 票不切片，每页 DoGet
+ * 拉回整个 part；当时样例靠第二条 statementDefaultScroll 连接 + URL 钉 x-fg-session-id
+ * 共享会话来获得显式 queryId。fg-p5 后单连接即正解。
  *
  * <p>运行：{@code mvn -pl flight/fg-client-sample exec:java -Dexec.args="<url> <user>
  * <password> <parquetPath> <pageSize>"}，参数可省略用默认值（url 为不含额外参数的基础
- * 地址，样例自行追加 useEncryption / x-fg-session-id / statementDefaultScroll）。
+ * 地址，样例自行追加 useEncryption）。
  */
 public final class FgClientSample {
 
@@ -76,25 +72,15 @@ public final class FgClientSample {
     info.setProperty("user", user);
     info.setProperty("password", password);
 
-    // 两条连接共享同一个 fg 会话（临时 view 会话级）
-    String sessionId = java.util.UUID.randomUUID().toString();
-    String streamUrl = withParams(base, "useEncryption=false", "x-fg-session-id=" + sessionId);
-    String scrollUrl =
-        withParams(
-            base, "useEncryption=false", "x-fg-session-id=" + sessionId,
-            "statementDefaultScroll=true");
-
-    System.out.println("[fg-sample] base=" + base + " sessionId=" + sessionId);
+    String url = withParams(base, "useEncryption=false");
+    System.out.println("[fg-sample] url=" + url);
     System.out.println("[fg-sample] parquet=" + parquetPath + " pageSize=" + pageSize);
 
-    // 模式一（默认连接：真流式 FORWARD_ONLY）
-    try (Connection conn = DriverManager.getConnection(streamUrl, info)) {
+    // 临时 view 会话级：两个模式共用同一条连接（同一个 fg 会话）
+    try (Connection conn = DriverManager.getConnection(url, info)) {
       createTempView(conn, parquetPath);
       StreamResult stream = streamAll(conn);
-      // 模式二（statementDefaultScroll 连接：显式 queryId 协议 + 服务端页切片）
-      try (Connection conn2 = DriverManager.getConnection(scrollUrl, info)) {
-        randomPages(conn2, stream, pageSize);
-      }
+      randomPages(conn, stream, pageSize);
     }
   }
 
@@ -170,9 +156,10 @@ public final class FgClientSample {
   // ------------------------------------------------------------------ 模式二
 
   /**
-   * Random paging: re-execute the SELECT on the statementDefaultScroll connection (fresh
-   * nonce x-fg-query-id per D28, gateway ② builds a new scrollable row; server-side page
-   * slicing per D27), then jump pages in random order via {@code absolute(offset)}.
+   * Random paging: re-execute the SELECT with an explicit SCROLL_INSENSITIVE statement on the
+   * same default connection (fg-p5: every app-level execute mints a fresh x-fg-query-id,
+   * gateway ② builds a new scrollable row; server-side page slicing per D27), then jump
+   * pages in random order via {@code absolute(offset)}.
    */
   private static void randomPages(Connection conn, StreamResult stream, int pageSize)
       throws SQLException {

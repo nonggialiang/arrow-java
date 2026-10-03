@@ -16,6 +16,7 @@
  */
 package org.apache.arrow.driver.jdbc;
 
+import java.sql.ResultSet;
 import java.sql.SQLException;
 import org.apache.arrow.driver.jdbc.client.ArrowFlightSqlClientHandler.PreparedStatement;
 import org.apache.arrow.driver.jdbc.utils.ConvertUtils;
@@ -41,6 +42,22 @@ public class ArrowFlightStatement extends AvaticaStatement implements ArrowFligh
 
   /** FG patch (D28): segment 对齐页大小（executeFlightInfoQuery 推导，ScrollResultSet 消费）。 */
   private volatile int fgPageSizeHint;
+
+  /**
+   * FG patch (fg-p5/D30)：瞬态失败续传粘槽（仅默认连接；statementDefaultScroll 连接走
+   * connection 级单槽）。非空 = 上次尝试以<b>瞬态</b>失败收场且仍在 Avatica 自动重试窗口内
+   * ——重试复用同一 nonce，网关 ① 命中在途行（断线续传，引擎不重跑）或终态行（误分类兜底，
+   * 粘性失败烧完重试预算）。应用级 execute 入口（{@link #executeQuery(String)} 等覆写）一律
+   * 清槽：字面语义"每次 execute 必新查询"——重试耗尽后应用再 execute 即 fresh nonce 新执行。
+   */
+  private String fgStickyNonce;
+  private String fgStickySql;
+
+  /** 应用级 execute 边界清粘槽（Avatica 内部重试在 executeInternal 环内直落本类，不经 JDBC 入口）。 */
+  void fgClearStickyExecution() {
+    fgStickyNonce = null;
+    fgStickySql = null;
+  }
 
   @Override
   public int pageSizeHint() {
@@ -119,6 +136,18 @@ public class ArrowFlightStatement extends AvaticaStatement implements ArrowFligh
           new org.apache.arrow.flight.FlightCallHeaders();
       headers.insert("x-fg-query-id", headerId);
       queryIdOption = new org.apache.arrow.flight.HeaderCallOption(headers);
+    } else if (sql != null) {
+      // FG patch (fg-p5/D30)：默认连接每次应用级 execute 铸新 queryId——网关 ② 直建行，
+      // 指纹去重不参与（JDBC 应用重执行同 SQL = 真重跑；DML 后重查同文本不再复用旧快照）。
+      // 瞬态失败保留粘槽供 Avatica 自动重试复用（① 续传）；SQL 守卫防 ①'（粘槽换 SQL）。
+      if (fgStickyNonce == null || !sql.trim().equals(fgStickySql)) {
+        fgStickyNonce = java.util.UUID.randomUUID().toString();
+        fgStickySql = sql.trim();
+      }
+      final org.apache.arrow.flight.CallHeaders headers =
+          new org.apache.arrow.flight.FlightCallHeaders();
+      headers.insert("x-fg-query-id", fgStickyNonce);
+      queryIdOption = new org.apache.arrow.flight.HeaderCallOption(headers);
     }
     try {
       final org.apache.arrow.flight.FlightInfo info;
@@ -136,11 +165,42 @@ public class ArrowFlightStatement extends AvaticaStatement implements ArrowFligh
       if (conn.statementDefaultScroll() && sql != null) {
         conn.recordExecution(sql, queryIdOf(info), maxRows);
       }
+      if (!conn.statementDefaultScroll() && sql != null) {
+        fgClearStickyExecution(); // 成功即清：下次应用级 execute = fresh nonce 新查询
+      }
       return info;
     } catch (final FlightRuntimeException e) {
-      // FG patch: surface poll-loop outcomes (CANCELLED, TIMED_OUT, ...) as SQLException.
+      // FG patch (fg-p5/D30)：终态失败（取消/引擎失败/SQL与认证错）直达应用——绕过
+      // NoSuchStatementException 触发的 Avatica 重试环；瞬态失败保留粘槽，重试复用同
+      // nonce 经网关 ① 续传在途行（断线续传而非引擎重跑）。
+      if (FgTerminalQueryException.isTerminalOutcome(e)) {
+        fgClearStickyExecution();
+        throw new FgTerminalQueryException("Query execution failed (terminal outcome).", e);
+      }
       throw new SQLException("Query execution failed.", e);
     }
+  }
+
+  // ------------------------------------------------- FG patch (fg-p5/D30)：应用级 execute 入口清粘槽
+  // Avatica 的内部重试环（executeInternal catch NoSuchStatementException → resetStatement →
+  // 重入）不经过这些 JDBC 入口——入口即"应用级 execute 边界"的精确判别点。
+
+  @Override
+  public ResultSet executeQuery(String sql) throws SQLException {
+    fgClearStickyExecution();
+    return super.executeQuery(sql);
+  }
+
+  @Override
+  public boolean execute(String sql) throws SQLException {
+    fgClearStickyExecution();
+    return super.execute(sql);
+  }
+
+  @Override
+  public long executeLargeUpdate(String sql) throws SQLException {
+    fgClearStickyExecution();
+    return super.executeLargeUpdate(sql);
   }
 
   /** 槽内 lastMaxRows 只读视图（pageSize 推导用；-1 = 无槽）。 */

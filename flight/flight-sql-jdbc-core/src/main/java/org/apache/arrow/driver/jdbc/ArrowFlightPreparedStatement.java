@@ -59,6 +59,20 @@ public class ArrowFlightPreparedStatement extends AvaticaPreparedStatement
   /** FG patch (D28): segment 对齐页大小（同 ArrowFlightStatement）。 */
   private volatile int fgPageSizeHint;
 
+  /**
+   * FG patch (fg-p5/D30)：瞬态失败续传粘槽（仅默认连接；语义同 ArrowFlightStatement——
+   * PreparedStatement 路径经 meta.execute + executeQueryInternal，实证无 Avatica 重试环，
+   * 粘槽在此无消费者，保留对称实现 + 入口清槽防御）。
+   */
+  private String fgStickyNonce;
+  private String fgStickySql;
+
+  /** 应用级 execute 边界清粘槽。 */
+  private void fgClearStickyExecution() {
+    fgStickyNonce = null;
+    fgStickySql = null;
+  }
+
   @Override
   public int pageSizeHint() {
     return fgPageSizeHint;
@@ -133,6 +147,16 @@ public class ArrowFlightPreparedStatement extends AvaticaPreparedStatement
           new org.apache.arrow.flight.FlightCallHeaders();
       headers.insert("x-fg-query-id", headerId);
       queryIdOption = new org.apache.arrow.flight.HeaderCallOption(headers);
+    } else if (sql != null) {
+      // FG patch (fg-p5/D30)：默认连接每次应用级 execute 铸新 queryId（同 ArrowFlightStatement）
+      if (fgStickyNonce == null || !sql.trim().equals(fgStickySql)) {
+        fgStickyNonce = java.util.UUID.randomUUID().toString();
+        fgStickySql = sql.trim();
+      }
+      final org.apache.arrow.flight.CallHeaders headers =
+          new org.apache.arrow.flight.FlightCallHeaders();
+      headers.insert("x-fg-query-id", fgStickyNonce);
+      queryIdOption = new org.apache.arrow.flight.HeaderCallOption(headers);
     }
     try {
       final org.apache.arrow.flight.FlightInfo info;
@@ -160,11 +184,38 @@ public class ArrowFlightPreparedStatement extends AvaticaPreparedStatement
                 : null,
             maxRows);
       }
+      if (!conn.statementDefaultScroll() && sql != null) {
+        fgClearStickyExecution();
+      }
       return info;
     } catch (final FlightRuntimeException e) {
-      // FG patch: surface poll-loop outcomes (CANCELLED, TIMED_OUT, ...) as SQLException.
+      // FG patch (fg-p5/D30)：终态失败直达应用（同 ArrowFlightStatement）
+      if (FgTerminalQueryException.isTerminalOutcome(e)) {
+        fgClearStickyExecution();
+        throw new FgTerminalQueryException("Query execution failed (terminal outcome).", e);
+      }
       throw new SQLException("Query execution failed.", e);
     }
+  }
+
+  // ------------------------------------------------ FG patch (fg-p5/D30)：应用级 execute 入口清粘槽
+
+  @Override
+  public boolean execute() throws SQLException {
+    fgClearStickyExecution();
+    return super.execute();
+  }
+
+  @Override
+  public java.sql.ResultSet executeQuery() throws SQLException {
+    fgClearStickyExecution();
+    return super.executeQuery();
+  }
+
+  @Override
+  public long executeLargeUpdate() throws SQLException {
+    fgClearStickyExecution();
+    return super.executeLargeUpdate();
   }
 
   private void recordCancelCredential(final FlightInfo info) {

@@ -35,6 +35,7 @@ under the License.
     <module>flight-sql</module>
     <module>flight-sql-jdbc-core</module>
     <module>flight-sql-jdbc-driver</module>
+    <module>fg-client-sample</module>
     <module>flight-integration-tests</module>
   </modules>
 </project>

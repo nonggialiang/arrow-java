@@ -1,0 +1,57 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+Licensed to the Apache Software Foundation (ASF) under one or more
+contributor license agreements.  See the NOTICE file distributed with
+this work for additional information regarding copyright ownership.
+The ASF licenses this file to You under the Apache License, Version 2.0
+(the "License"); you may not use this file except in compliance with
+the License.  You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+-->
+<project xmlns="http://maven.apache.org/POM/4.0.0" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 http://maven.apache.org/xsd/maven-4.0.0.xsd">
+  <modelVersion>4.0.0</modelVersion>
+  <parent>
+    <groupId>org.apache.arrow</groupId>
+    <artifactId>arrow-flight</artifactId>
+    <version>19.0.0-fg-p1</version>
+  </parent>
+
+  <artifactId>fg-client-sample</artifactId>
+  <packaging>jar</packaging>
+  <name>FG Client Sample (flight-gateway JDBC)</name>
+  <description>
+    Standalone sample: connect to flight-gateway with the FG-patched Flight SQL JDBC
+    driver, create a temporary view over a parquet file, then consume the SELECT in
+    two modes -- streaming (FORWARD_ONLY next()) and random server-side paging
+    (scroll + absolute). Run with: mvn exec:java -Dexec.args="&lt;url&gt; &lt;user&gt; &lt;password&gt; &lt;parquetPath&gt; &lt;pageSize&gt;"
+  </description>
+
+  <dependencies>
+    <!-- FG patched driver (shaded, self-contained) -->
+    <dependency>
+      <groupId>org.apache.arrow</groupId>
+      <artifactId>flight-sql-jdbc-driver</artifactId>
+      <version>${project.version}</version>
+    </dependency>
+  </dependencies>
+
+  <build>
+    <plugins>
+      <plugin>
+        <groupId>org.codehaus.mojo</groupId>
+        <artifactId>exec-maven-plugin</artifactId>
+        <version>3.2.0</version>
+        <configuration>
+          <mainClass>org.apache.arrow.fg.sample.FgClientSample</mainClass>
+        </configuration>
+      </plugin>
+    </plugins>
+  </build>
+</project>

@@ -321,13 +321,18 @@ public final class ArrowFlightSqlClientHandler implements AutoCloseable {
 
   @Override
   public void close() throws SQLException {
-    if (catalog.isPresent()) {
-      try {
-        sqlClient.closeSession(new CloseSessionRequest(), getOptions());
-      } catch (FlightRuntimeException fre) {
-        handleBenignCloseException(
-            fre, "Failed to close Flight SQL session.", "closing Flight SQL session");
-      }
+    // FG patch (fg-p5 后补/D30): CloseSession 无条件 best-effort——原上游仅在 catalog 存在时
+    // 发送，FG 连接不携 catalog → 断开从不通知网关（fg_session 僵尸 ACTIVE + 引擎 Connect
+    // 会话滞留至 Spark 原生 1h 惰性驱逐/引擎 idle 看门狗）。x-fg-session-id 已在持久
+    // options（ArrowFlightConnection.withCallOptions(config.toCallOption())），网关收到即
+    // D20 语义：引擎会话逐出 + fg_session CLOSED(client) sticky（未知会话幂等）。对无会话
+    // 语义/不可达的服务端（UNIMPLEMENTED/UNAVAILABLE 等）一律吞——best-effort 不得阻断
+    // 本地资源清理。
+    try {
+      sqlClient.closeSession(new CloseSessionRequest(), getOptions());
+    } catch (final RuntimeException e) {
+      // best-effort（warn 可观测：连接可能已断/服务端无会话语义）
+      LOGGER.warn("CloseSession best-effort failed: {}", String.valueOf(e));
     }
     try {
       AutoCloseables.close(sqlClient);

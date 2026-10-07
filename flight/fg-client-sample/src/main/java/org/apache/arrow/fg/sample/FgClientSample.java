@@ -29,22 +29,30 @@ import java.util.Properties;
 import java.util.Random;
 
 /**
- * FG (flight-gateway) JDBC client sample (D29, simplified by fg-p5/D30).
+ * FG (flight-gateway) JDBC client sample (D29, simplified by fg-p5/D30; mode-3 added D31).
  *
  * <p>用 FG 定制驱动（本 fork，{@code 19.0.0-fg-p1}）连接 flight-gateway 执行 Spark SQL：
  *
  * <ol>
  *   <li>{@code CREATE OR REPLACE TEMPORARY VIEW ... USING parquet OPTIONS (path 's3a://...')}
- *       —— 走网关命令路径；临时 view 是<b>会话级</b>对象，两个模式共用同一条连接。
- *   <li>模式一（流式）：默认连接（无参 statement = {@code TYPE_FORWARD_ONLY}），
+ *       —— 走网关命令路径；临时 view 是<b>会话级</b>对象，模式一/二共用同一条连接。
+ *   <li>模式一（流式，relay）：默认连接（无参 statement = {@code TYPE_FORWARD_ONLY}），
  *       {@code next()} 逐行消费到底——单次 DoGet 中继流，统计首行耗时与「第一条消费到
  *       最后一条」的整体耗时。
- *   <li>模式二（随机分页）：同一默认连接上显式 {@code TYPE_SCROLL_INSENSITIVE} statement
- *       <b>重执行</b>同一 SELECT——fg-p5 起默认连接每次应用级 execute 自动铸造 fresh nonce
- *       {@code x-fg-query-id}（与模式一必然不同 id，网关 ② 直建 scrollable 新行、不走同
- *       session 同 SQL 指纹复用，引擎真重跑）+ 服务端页切片（D27）；按模式一行数随机页序
+ *   <li>模式二（随机分页，relay）：同一默认连接上显式 {@code TYPE_SCROLL_INSENSITIVE}
+ *       statement <b>重执行</b>同一 SELECT——fg-p5 起默认连接每次应用级 execute 自动铸造
+ *       fresh nonce {@code x-fg-query-id}（与模式一必然不同 id，网关 ② 直建 scrollable
+ *       新行、引擎真重跑）+ 服务端页切片（D27）；按模式一行数随机页序
  *       {@code absolute(offset)} 跳页，每页 fetchSize 行，统计重执行耗时、平均每页耗时与
  *       整体耗时；首列校验和与模式一比对（页序无关的求和），验证随机页数据一致。
+ *   <li>模式三（https presign 直取）：独立连接 URL 参数 {@code x-fg-endpoint-mode=https}
+ *       （非内建连接属性经驱动透传为 RPC 头，D15）→ 网关按头落行 {@code mode=HTTPS}、
+ *       终态 endpoints = presigned URL——驱动走 openEndpoint 以 <b>HTTP GET + Arrow IPC
+ *       直取对象存储</b>（fork 消费侧补丁），网关只做注册/物化、<b>不占 relay 线程</b>。
+ *       临时 view 会话级 → 本模式自带连接自建 view。注意：https 模式要求<b>客户端能直连
+ *       对象存储 endpoint</b>（presigned URL 指向 MinIO/S3 本身），且客户端 JVM 需带
+ *       {@code --add-opens java.base/java.nio 等三件}（arrow-memory 反射 DirectByteBuffer，
+ *       网关/引擎同款 flags；relay 模式不受影响）。
  * </ol>
  *
  * <p><b>历史注记</b>：fg-p5 之前默认连接不带 queryId 头，重执行同 SQL 命中网关指纹终态
@@ -53,8 +61,9 @@ import java.util.Random;
  * 共享会话来获得显式 queryId。fg-p5 后单连接即正解。
  *
  * <p>运行：{@code mvn -pl flight/fg-client-sample exec:java -Dexec.args="<url> <user>
- * <password> <parquetPath> <pageSize>"}，参数可省略用默认值（url 为不含额外参数的基础
- * 地址，样例自行追加 useEncryption）。
+ * <password> <parquetPath> <pageSize> <mode>"}，参数可省略用默认值（url 为不含额外参数的
+ * 基础地址，样例自行追加 useEncryption）；mode ∈ {all（默认）| 1/stream | 2/page | 3/https}，
+ * 模式二的页数依赖模式一行数——单独跑 2 会先自动执行 1。
  */
 public final class FgClientSample {
 
@@ -67,20 +76,35 @@ public final class FgClientSample {
     String password = arg(args, 2, "fg");
     String parquetPath = arg(args, 3, "s3a://ssdr-bucket/chris/test/file.parquet");
     int pageSize = Integer.parseInt(arg(args, 4, "100"));
+    String mode = arg(args, 5, "all").toLowerCase();
 
     Properties info = new Properties();
     info.setProperty("user", user);
     info.setProperty("password", password);
 
-    String url = withParams(base, "useEncryption=false");
-    System.out.println("[fg-sample] url=" + url);
+    System.out.println("[fg-sample] base=" + base + " mode=" + mode);
     System.out.println("[fg-sample] parquet=" + parquetPath + " pageSize=" + pageSize);
 
-    // 临时 view 会话级：两个模式共用同一条连接（同一个 fg 会话）
-    try (Connection conn = DriverManager.getConnection(url, info)) {
-      createTempView(conn, parquetPath);
-      StreamResult stream = streamAll(conn);
-      randomPages(conn, stream, pageSize);
+    boolean wantStream = mode.equals("all") || mode.equals("1") || mode.equals("stream");
+    boolean wantPage = mode.equals("all") || mode.equals("2") || mode.equals("page");
+    boolean wantHttps = mode.equals("all") || mode.equals("3") || mode.equals("https");
+
+    StreamResult stream = null;
+    if (wantStream || wantPage) {
+      // 模式一/二（relay 通道）：临时 view 会话级，共用同一条连接（同一个 fg 会话）
+      String url = withParams(base, "useEncryption=false");
+      try (Connection conn = DriverManager.getConnection(url, info)) {
+        createTempView(conn, parquetPath);
+        if (wantStream || wantPage) { // 单跑模式二也要先取总行数
+          stream = streamAll(conn);
+        }
+        if (wantPage) {
+          randomPages(conn, stream, pageSize);
+        }
+      }
+    }
+    if (wantHttps) {
+      httpsPresign(base, info, parquetPath, stream);
     }
   }
 
@@ -228,6 +252,57 @@ public final class FgClientSample {
           System.out.printf(
               "[fg-sample]   !! 校验不一致：rows %d/%d checksum %d/%d%n",
               gotRows, stream.rows, checksum, stream.checksum);
+        }
+      }
+    }
+  }
+
+  // ------------------------------------------------------------------ 模式三
+
+  /**
+   * Mode three: https presign direct fetch — connection URL param x-fg-endpoint-mode=https
+   * (non-builtin property is passed through as an RPC header), gateway registers mode=HTTPS
+   * and returns presigned endpoints; the driver fetches them via openEndpoint over plain
+   * HTTP GET + Arrow IPC (no relay thread on the gateway). Own connection/own session, so
+   * the temporary view is re-created here.
+   */
+  private static void httpsPresign(
+      String base, Properties info, String parquetPath, StreamResult relayStream)
+      throws SQLException {
+    System.out.println("[fg-sample] ④ 模式三（https presign 直取）：客户端 HTTP GET 对象存储，网关不占 relay 线程");
+    String url = withParams(base, "useEncryption=false", "x-fg-endpoint-mode=https");
+    try (Connection conn = DriverManager.getConnection(url, info)) {
+      createTempView(conn, parquetPath); // 会话级 view：本连接自有会话，重建
+      long t0 = System.nanoTime();
+      long firstRow = -1;
+      long lastRow = -1;
+      long rows = 0;
+      long checksum = 0;
+      try (Statement st = conn.createStatement();
+          ResultSet rs = st.executeQuery(SELECT_SQL)) {
+        while (rs.next()) {
+          if (firstRow < 0) {
+            firstRow = System.nanoTime();
+            printFirstRow(rs);
+          }
+          checksum += String.valueOf(rs.getObject(1)).hashCode();
+          rows++;
+          lastRow = System.nanoTime();
+        }
+      }
+      System.out.printf("[fg-sample]   行数=%d%n", rows);
+      System.out.printf(
+          "[fg-sample]   首行耗时（执行等待+首批）=%.0f ms%n", firstRow < 0 ? 0D : ms(firstRow - t0));
+      System.out.printf(
+          "[fg-sample]   首条→末条消费耗时=%.0f ms%n", firstRow < 0 ? 0D : ms(lastRow - firstRow));
+      System.out.printf("[fg-sample]   端到端=%.0f ms%n", ms(lastRow < 0 ? 0 : lastRow - t0));
+      if (relayStream != null) {
+        if (rows == relayStream.rows && checksum == relayStream.checksum) {
+          System.out.println("[fg-sample]   首列校验和与模式一一致（relay/https 两通道数据相同）");
+        } else {
+          System.out.printf(
+              "[fg-sample]   !! 校验不一致：rows %d/%d checksum %d/%d%n",
+              rows, relayStream.rows, checksum, relayStream.checksum);
         }
       }
     }

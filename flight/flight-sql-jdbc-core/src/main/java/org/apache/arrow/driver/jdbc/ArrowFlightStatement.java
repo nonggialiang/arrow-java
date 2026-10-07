@@ -44,11 +44,13 @@ public class ArrowFlightStatement extends AvaticaStatement implements ArrowFligh
   private volatile int fgPageSizeHint;
 
   /**
-   * FG patch (fg-p5/D30)：瞬态失败续传粘槽（仅默认连接；statementDefaultScroll 连接走
-   * connection 级单槽）。非空 = 上次尝试以<b>瞬态</b>失败收场且仍在 Avatica 自动重试窗口内
-   * ——重试复用同一 nonce，网关 ① 命中在途行（断线续传，引擎不重跑）或终态行（误分类兜底，
-   * 粘性失败烧完重试预算）。应用级 execute 入口（{@link #executeQuery(String)} 等覆写）一律
-   * 清槽：字面语义"每次 execute 必新查询"——重试耗尽后应用再 execute 即 fresh nonce 新执行。
+   * FG patch (fg-p5/D30；D32 修正生命周期)：瞬态失败续传粘槽（仅默认连接；
+   * statementDefaultScroll 连接走 connection 级单槽）。非空 = 本次<b>应用级</b> execute
+   * 尚有结果未定/未完成的尝试，Avatica 自动重试应复用同一 nonce——网关 ① 命中在途行
+   * （断线续传）或已完成行（下游取数失败重试，<b>零 SQL 重跑</b>）。清槽仅两处：应用级
+   * execute 入口（{@link #executeQuery(String)} 等覆写——字面语义"每次 execute 必新查询"）
+   * 与终态失败（取消/引擎失败，无重试可服务）；<b>成功不清</b>——poll 成功后下游取数
+   * （relay DoGet / https presign GET）失败仍属本次尝试，重试须 ① 复用而非 ② 重跑。
    */
   private String fgStickyNonce;
   private String fgStickySql;
@@ -165,9 +167,11 @@ public class ArrowFlightStatement extends AvaticaStatement implements ArrowFligh
       if (conn.statementDefaultScroll() && sql != null) {
         conn.recordExecution(sql, queryIdOf(info), maxRows);
       }
-      if (!conn.statementDefaultScroll() && sql != null) {
-        fgClearStickyExecution(); // 成功即清：下次应用级 execute = fresh nonce 新查询
-      }
+      // fg-p5 后补（D32）：成功不再清粘槽——清槽职责只在应用级 execute 入口与终态失败。
+      // poll 成功 ≠ 本次尝试成功：下游取数失败（如 https presign URL 不可达）发生在
+      // executeFlightInfoQuery 返回之后，若此刻已清槽，Avatica 重试将铸 fresh nonce →
+      // 网关 ② 重新执行 SQL（实证 5 次重试 = 5 次引擎重跑）；保留粘槽则重试经 ① 复用
+      // 已完成行（零重跑），只重试取数本身。
       return info;
     } catch (final FlightRuntimeException e) {
       // FG patch (fg-p5/D30)：终态失败（取消/引擎失败/SQL与认证错）直达应用——绕过

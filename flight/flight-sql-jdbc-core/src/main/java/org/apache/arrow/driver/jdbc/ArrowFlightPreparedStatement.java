@@ -184,9 +184,7 @@ public class ArrowFlightPreparedStatement extends AvaticaPreparedStatement
                 : null,
             maxRows);
       }
-      if (!conn.statementDefaultScroll() && sql != null) {
-        fgClearStickyExecution();
-      }
+      // fg-p5 后补（D32）：成功不清粘槽（同 ArrowFlightStatement——下游取数失败仍在重试窗口）
       return info;
     } catch (final FlightRuntimeException e) {
       // FG patch (fg-p5/D30)：终态失败直达应用（同 ArrowFlightStatement）

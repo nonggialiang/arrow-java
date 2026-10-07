@@ -199,20 +199,20 @@ public final class ArrowFlightSqlClientHandler implements AutoCloseable {
             // FG patch: an endpoint with an empty ticket and an http(s) location addresses
             // its data by a (pre-signed) URL — fetch it over plain HTTP GET instead of
             // dialing a gRPC client for the location.
+            // FG patch (D32 后补): presign 直取失败不进 exceptions 累积（那会包成
+            // SQLException → MetaImpl 转 NoSuchStatementException → Avatica 重试通道，
+            // 5 次徒劳重试后只剩泛化耗尽异常）。此类失败（不可达/403/404）是确定性故障
+            // ——FRE（RuntimeException）直接上抛：executeInternal 不重试，Helper 包
+            // SQLException 时保留完整 cause 链，应用立即看到 "Failed to fetch <url>: 原因"。
             if (endpoint.getTicket().getBytes().length == 0
                 && ("http".equalsIgnoreCase(endpointScheme)
                     || "https".equalsIgnoreCase(endpointScheme))) {
-              try {
-                stream =
-                    new CloseableEndpointStreamPair(
-                        new ReaderEndpointStream(sqlClient.openEndpoint(endpoint, getOptions())),
-                        null);
-                // Make sure we actually get data from the server
-                stream.getStream().getSchema();
-              } catch (Exception ex) {
-                exceptions.add(ex);
-                continue;
-              }
+              stream =
+                  new CloseableEndpointStreamPair(
+                      new ReaderEndpointStream(sqlClient.openEndpoint(endpoint, getOptions())),
+                      null);
+              // Make sure we actually get data from the server
+              stream.getStream().getSchema();
               break;
             }
             if (endpointScheme.equals(LocationSchemes.REUSE_CONNECTION)) {
@@ -290,6 +290,14 @@ public final class ArrowFlightSqlClientHandler implements AutoCloseable {
         outerException.addSuppressed(innerEx);
       }
 
+      // FG patch (D32 后补): FRE 不包 SQLException——原包装经 MetaImpl 转
+      // NoSuchStatementException 进 Avatica 重试环（5 次徒劳重试，耗尽异常吞因链）。
+      // presign HTTP 直取失败（不可达/403/404，确定性故障）以 FRE 直通 RuntimeException
+      // 通道：executeInternal 不重试，Helper 包 SQLException 保留完整 cause，
+      // 应用立即看到 "Failed to fetch <url>: 原因"。
+      if (outerException instanceof FlightRuntimeException) {
+        throw (FlightRuntimeException) outerException;
+      }
       if (outerException instanceof SQLException) {
         throw (SQLException) outerException;
       }

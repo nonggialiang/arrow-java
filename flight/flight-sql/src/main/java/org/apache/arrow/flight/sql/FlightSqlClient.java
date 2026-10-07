@@ -587,7 +587,7 @@ public class FlightSqlClient implements AutoCloseable {
               HttpRequest.newBuilder(uri).GET().build(), HttpResponse.BodyHandlers.ofInputStream());
     } catch (final IOException e) {
       throw CallStatus.UNAVAILABLE
-          .withDescription("Failed to fetch " + uri + ": " + e.getMessage())
+          .withDescription("Failed to fetch " + redactQuery(uri) + ": " + e.getMessage())
           .withCause(e)
           .toRuntimeException();
     } catch (final InterruptedException e) {
@@ -597,11 +597,21 @@ public class FlightSqlClient implements AutoCloseable {
     if (response.statusCode() != 200) {
       AutoCloseables.closeNoChecked(response.body());
       throw CallStatus.INTERNAL
-          .withDescription("HTTP GET " + uri + " failed with status " + response.statusCode())
+          .withDescription(
+              "HTTP GET " + redactQuery(uri) + " failed with status " + response.statusCode())
           .toRuntimeException();
     }
     // The response body is closed when the returned reader is closed.
     return new ArrowStreamReader(response.body(), client.getAllocator());
+  }
+
+  /**
+   * Strips the query string (credentials/signature) from a pre-signed URL for error messages.
+   * The query of a pre-signed URL is a bearer credential — it must not leak into exceptions or
+   * logs; host and object path are kept for troubleshooting.
+   */
+  private static String redactQuery(URI uri) {
+    return uri.getScheme() + "://" + uri.getAuthority() + uri.getPath();
   }
 
   /**

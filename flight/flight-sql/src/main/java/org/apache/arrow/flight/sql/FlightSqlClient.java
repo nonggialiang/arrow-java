@@ -106,6 +106,7 @@ import org.apache.arrow.util.AutoCloseables;
 import org.apache.arrow.util.Preconditions;
 import org.apache.arrow.vector.VectorSchemaRoot;
 import org.apache.arrow.vector.VectorUnloader;
+import org.apache.arrow.compression.CommonsCompressionFactory;
 import org.apache.arrow.vector.ipc.ArrowReader;
 import org.apache.arrow.vector.ipc.ArrowStreamReader;
 import org.apache.arrow.vector.ipc.ReadChannel;
@@ -602,7 +603,11 @@ public class FlightSqlClient implements AutoCloseable {
           .toRuntimeException();
     }
     // The response body is closed when the returned reader is closed.
-    return new ArrowStreamReader(response.body(), client.getAllocator());
+    // FG patch (D33): pass the compression codec factory — result parts may carry
+    // Arrow IPC body compression (zstd/lz4, message-level BodyCompression); the
+    // reader decompresses transparently, uncompressed parts are unaffected.
+    return new ArrowStreamReader(
+        response.body(), client.getAllocator(), CommonsCompressionFactory.INSTANCE);
   }
 
   /**

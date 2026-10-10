@@ -20,6 +20,7 @@ import org.apache.arrow.vector.compression.CompressionCodec;
 module org.apache.arrow.compression {
   exports org.apache.arrow.compression;
 
+  requires aircompressor;
   requires com.github.luben.zstd_jni;
   requires org.apache.arrow.memory.core;
   requires org.apache.arrow.vector;

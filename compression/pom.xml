@@ -57,5 +57,11 @@ under the License.
       <artifactId>zstd-jni</artifactId>
       <version>1.5.7-6</version>
     </dependency>
+    <!-- FG patch (D33): AirLz4FrameCodec 后端（LZ4 frame 手写封装） -->
+    <dependency>
+      <groupId>io.airlift</groupId>
+      <artifactId>aircompressor</artifactId>
+      <version>0.27</version>
+    </dependency>
   </dependencies>
 </project>

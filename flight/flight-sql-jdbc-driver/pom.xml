@@ -101,6 +101,10 @@ under the License.
                   <shadedPattern>org.apache.arrow.driver.jdbc.shaded.com.</shadedPattern>
                   <excludes>
                     <exclude>com.sun.**</exclude>
+                    <!-- zstd-jni（arrow-compression 传递依赖）：JNI native 符号名绑定
+                         Java 包名（Java_com_github_luben_...），relocate 后符号失配 →
+                         UnsatisfiedLinkError（D33 实证）。native 库保持原名原路径。 -->
+                    <exclude>com.github.luben.**</exclude>
                   </excludes>
                 </relocation>
                 <relocation>

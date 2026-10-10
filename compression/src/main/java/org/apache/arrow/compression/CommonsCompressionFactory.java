@@ -32,7 +32,9 @@ public class CommonsCompressionFactory implements CompressionCodec.Factory {
   public CompressionCodec createCodec(CompressionUtil.CodecType codecType) {
     switch (codecType) {
       case LZ4_FRAME:
-        return new Lz4CompressionCodec();
+        // FG patch (D33): aircompressor 后端——commons-compress 纯 Java LZ4 实测
+        // 9.4s/MiB（写路径不可用），见 AirLz4FrameCodec javadoc
+        return new AirLz4FrameCodec();
       case ZSTD:
         return new ZstdCompressionCodec();
       default:
@@ -44,7 +46,7 @@ public class CommonsCompressionFactory implements CompressionCodec.Factory {
   public CompressionCodec createCodec(CompressionUtil.CodecType codecType, int compressionLevel) {
     switch (codecType) {
       case LZ4_FRAME:
-        return new Lz4CompressionCodec();
+        return new AirLz4FrameCodec();
       case ZSTD:
         return new ZstdCompressionCodec(compressionLevel);
       default:

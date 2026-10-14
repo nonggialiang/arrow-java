@@ -106,7 +106,7 @@ import org.apache.arrow.util.AutoCloseables;
 import org.apache.arrow.util.Preconditions;
 import org.apache.arrow.vector.VectorSchemaRoot;
 import org.apache.arrow.vector.VectorUnloader;
-import org.apache.arrow.compression.CommonsCompressionFactory;
+import org.apache.arrow.compression.ResilientCompressionFactory;
 import org.apache.arrow.vector.ipc.ArrowReader;
 import org.apache.arrow.vector.ipc.ArrowStreamReader;
 import org.apache.arrow.vector.ipc.ReadChannel;
@@ -606,8 +606,12 @@ public class FlightSqlClient implements AutoCloseable {
     // FG patch (D33): pass the compression codec factory — result parts may carry
     // Arrow IPC body compression (zstd/lz4, message-level BodyCompression); the
     // reader decompresses transparently, uncompressed parts are unaffected.
+    // FG patch (D34): ResilientCompressionFactory — objects corrupted by upstream
+    // write bug apache/arrow-java#1116 (zeroed 8-byte length prefix + intact zstd
+    // frame) are recovered via the frame-declared content size instead of failing
+    // with IndexOutOfBoundsException (see the factory javadoc for the full chain).
     return new ArrowStreamReader(
-        response.body(), client.getAllocator(), CommonsCompressionFactory.INSTANCE);
+        response.body(), client.getAllocator(), ResilientCompressionFactory.INSTANCE);
   }
 
   /**

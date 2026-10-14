@@ -63,5 +63,17 @@ under the License.
       <artifactId>aircompressor</artifactId>
       <version>0.27</version>
     </dependency>
+    <!-- FG patch (D34): TestResilientCompressionFactory 手工解 IPC framing 改写 buffer 前缀 -->
+    <dependency>
+      <groupId>org.apache.arrow</groupId>
+      <artifactId>arrow-format</artifactId>
+      <scope>test</scope>
+    </dependency>
+    <dependency>
+      <groupId>com.google.flatbuffers</groupId>
+      <artifactId>flatbuffers-java</artifactId>
+      <version>${dep.fbs.version}</version>
+      <scope>test</scope>
+    </dependency>
   </dependencies>
 </project>

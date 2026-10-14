@@ -31,26 +31,28 @@ import org.apache.commons.compress.compressors.lz4.XXHash32;
  * FG patch (D33): LZ4_FRAME codec backed by <b>aircompressor</b> instead of commons-compress.
  *
  * <p>Rationale: commons-compress {@code FramedLZ4CompressorOutputStream} is a pure-java
- * implementation with pathological write performance (measured 9.4s per MiB vs 0.5s for
- * zstd-jni — a sink writing one 4 MiB result took 38s). aircompressor's LZ4 (block format,
- * pure java, no JNI) is fast and already on the Spark executor classpath; this codec
- * hand-emits the standard LZ4 frame format (v1.6.3) around it: magic + FLG/BD/HC header,
- * independent blocks (max 4 MiB, incompressible blocks stored raw with the high bit set),
- * end mark; no content/block checksums. HC 用 commons-compress 的 XXHash32（读端零成本）。
- * pyarrow / arrow C++ read the frames natively.
+ * implementation with pathological write performance (measured 9.4s per MiB vs 0.5s for zstd-jni —
+ * a sink writing one 4 MiB result took 38s). aircompressor's LZ4 (block format, pure java, no JNI)
+ * is fast and already on the Spark executor classpath; this codec hand-emits the standard LZ4 frame
+ * format (v1.6.3) around it: magic + FLG/BD/HC header, independent blocks (max 4 MiB,
+ * incompressible blocks stored raw with the high bit set), end mark; no content/block checksums. HC
+ * 用 commons-compress 的 XXHash32（读端零成本）。 pyarrow / arrow C++ read the frames natively.
  *
- * <p>The Arrow buffer layout ([8B uncompressed length][compressed body]) is handled by
- * {@link AbstractCompressionCodec}.
+ * <p>The Arrow buffer layout ([8B uncompressed length][compressed body]) is handled by {@link
+ * AbstractCompressionCodec}.
  */
 public class AirLz4FrameCodec extends AbstractCompressionCodec {
 
   // LZ4 frame magic：字节序列 04 22 4D 18（LE 数值 0x184D2204——注意不是直觉的
   // 0x184D2A50，以 python-lz4 权威字节序为准，实证 2026-10-10）
   private static final int MAGIC = 0x184D2204;
+
   /** FLG: version 01 | block independence; no block/content checksum, no content size. */
   private static final int FLG = 0x60;
+
   /** BD: block max size code 7 = 4 MiB. */
   private static final int BD = 0x70;
+
   private static final int BLOCK_MAX = 4 * 1024 * 1024;
 
   @Override
